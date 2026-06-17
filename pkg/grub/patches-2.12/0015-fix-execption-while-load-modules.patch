@@ -1,0 +1,42 @@
+From 1baa4d60b85b84d1b9606664abde9105c6e9a275 Mon Sep 17 00:00:00 2001
+From: Jorney <qtu@ambarella.com>
+Date: Fri, 12 Jun 2026 14:26:13 +0800
+Subject: [PATCH] fix execption while load modules
+
+Signed-off-by: Jorney <qtu@ambarella.com>
+---
+ grub-core/kern/arm64/cache_flush.S | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/grub-core/kern/arm64/cache_flush.S b/grub-core/kern/arm64/cache_flush.S
+index e064f7ece..6abb93a70 100644
+--- a/grub-core/kern/arm64/cache_flush.S
++++ b/grub-core/kern/arm64/cache_flush.S
+@@ -29,13 +29,13 @@
+ // x1 - *end (exclusive)
+ // x2 - line size
+ FUNCTION(grub_arch_clean_dcache_range)
+-	// Clean data cache for range to point-of-unification
++	// Clean data cache for range to point-of-coherency
+ 1:	cmp	x0, x1
+ 	b.ge	2f
+-	dc	cvau, x0		// Clean Virtual Address to PoU
++	dc	civac, x0		// Clean & invalidate to PoC
+ 	add	x0, x0, x2		// Next line
+ 	b	1b
+-2:	dsb	ish
++2:	dsb	sy
+ 	isb
+ 	ret
+ 
+@@ -50,6 +50,6 @@ FUNCTION(grub_arch_invalidate_icache_range)
+ 	add	x0, x0, x2		// Next line
+ 	b	1b
+ 	// Branch predictor invalidation not needed on AArch64
+-2:	dsb	ish
++2:	dsb	sy
+ 	isb
+ 	ret
+-- 
+2.34.1
+
