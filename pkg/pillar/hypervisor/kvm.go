@@ -534,6 +534,20 @@ const qemuVsockTemplate = `
   guest-cid = "{{.GuestCID}}"
 `
 
+// ivshmem-plain takes its window size from the memory backend rather than
+// from a property of its own, and registers it as 64-bit prefetchable BAR2.
+const qemuIvshmemTemplate = `
+[object "{{.ID}}"]
+  qom-type = "memory-backend-file"
+  mem-path = "{{.MemPath}}"
+  size = "{{.Size}}"
+  share = "on"
+
+[device "{{.ID}}-dev"]
+  driver = "ivshmem-plain"
+  memdev = "{{.ID}}"
+`
+
 const qemuSwtpmTemplate = `
 [chardev "swtpm"]
   backend = "socket"
@@ -630,10 +644,18 @@ type tQemuVsockContext struct {
 	GuestCID string
 }
 
+// Context for qemuIvshmemTemplate.
+type tQemuIvshmemContext struct {
+	ID      string
+	MemPath string
+	Size    uint64
+}
+
 var (
 	tQemuGlobalConf, tQemuSwtmp, tQemuVsock              *template.Template
 	tQemuPCIeBridge, tQemuPCIPassthru, tQemuPCIeRootPort *template.Template
 	tQemuDisk, tQemuNet, tQemuSerial, tQemuCANBus        *template.Template
+	tQemuIvshmem                                         *template.Template
 )
 
 // Initialize all Go templates used to generate qemu config file.
@@ -650,6 +672,10 @@ func init() {
 	tQemuVsock, err = template.New("qemuVsock").Parse(qemuVsockTemplate)
 	if err != nil {
 		panic(fmt.Errorf("parsing qemuVsockTemplate failed: %w", err))
+	}
+	tQemuIvshmem, err = template.New("qemuIvshmem").Parse(qemuIvshmemTemplate)
+	if err != nil {
+		panic(fmt.Errorf("parsing qemuIvshmemTemplate failed: %w", err))
 	}
 	tQemuPCIeBridge, err = template.New("qemuPCIeBridge").Parse(qemuPCIeBridgeTemplate)
 	if err != nil {
@@ -797,6 +823,187 @@ func (ctx KvmContext) Task(status *types.DomainStatus) types.Task {
 	return ctx
 }
 
+const (
+	// Model cbattr keys parameterising an ivshmem window.
+	ivshmemCbattrPath = "shmpath"
+	ivshmemCbattrSize = "shmsize"
+	// Used when the model declares a window but gives no size.
+	ivshmemDefaultSize = uint64(16 << 20)
+	// Where a window path is derived when the model carries no shmpath.
+	ivshmemDefaultDir = "/dev/shm"
+	// Sanity bound so a typo in the model cannot ask for a terabyte.
+	ivshmemMaxSize = uint64(64 << 30)
+	// A window smaller than a page cannot be a PCI BAR.
+	ivshmemMinSize = uint64(4096)
+)
+
+// ivshmemWindow is one shared-memory window to expose to a domain.
+type ivshmemWindow struct {
+	id      string
+	memPath string
+	size    uint64
+}
+
+// parseIvshmemSize accepts a plain byte count or a K/M/G suffixed size.
+func parseIvshmemSize(s string) (uint64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty size")
+	}
+	mult := uint64(1)
+	switch s[len(s)-1] {
+	case 'k', 'K':
+		mult = 1 << 10
+		s = s[:len(s)-1]
+	case 'm', 'M':
+		mult = 1 << 20
+		s = s[:len(s)-1]
+	case 'g', 'G':
+		mult = 1 << 30
+		s = s[:len(s)-1]
+	}
+	n, err := strconv.ParseUint(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size %q: %w", s, err)
+	}
+	if n == 0 || n > ivshmemMaxSize/mult {
+		return 0, fmt.Errorf("size %q out of range", s)
+	}
+	return n * mult, nil
+}
+
+// ivshmemWindowFromBundle recognises an IoBundle asking for an ivshmem window,
+// returning (nil, nil) when the bundle is something else.
+//
+// The marker is an IO_TYPE_OTHER bundle carrying no physical resource of its
+// own. Such a bundle is inert everywhere else on the KVM path, which is what
+// lets it act as a per-app gate: assignment-group exclusivity then guarantees
+// only one app instance can own a given window.
+//
+// Parameters come from cbattr when the controller supplies them and are
+// otherwise derived from the logical label, so the feature still works against
+// a controller that drops unknown cbattr keys.
+func ivshmemWindowFromBundle(ib types.IoBundle) (*ivshmemWindow, error) {
+	if ib.Type != types.IoOther {
+		return nil, nil
+	}
+	if ib.PciLong != "" || ib.Ifname != "" || ib.Serial != "" || ib.UsbAddr != "" {
+		return nil, nil
+	}
+	label := ib.Logicallabel
+	if label == "" {
+		label = ib.Phylabel
+	}
+	if label == "" {
+		return nil, nil
+	}
+	w := ivshmemWindow{
+		id:      label,
+		memPath: filepath.Join(ivshmemDefaultDir, label),
+		size:    ivshmemDefaultSize,
+	}
+	if p := ib.Cbattr[ivshmemCbattrPath]; p != "" {
+		w.memPath = p
+	}
+	if s := ib.Cbattr[ivshmemCbattrSize]; s != "" {
+		size, err := parseIvshmemSize(s)
+		if err != nil {
+			return nil, logError("ivshmem window %s: %v", label, err)
+		}
+		w.size = size
+	}
+	return &w, nil
+}
+
+// ensureSharedMemoryFile creates and sizes the ivshmem backing file.
+//
+// QEMU's memory-backend-file would create the file itself; doing it here pins
+// the size and mode explicitly and turns a bad size into a clear error before
+// QEMU is launched rather than a failed domain afterwards. The window is
+// mapped as a PCI BAR, so its size has to be a power of two.
+//
+// The file is never shrunk and never unlinked: a NOHYPER container may already
+// hold a mapping of it, and leaving it in place means an HVM restart reuses the
+// same region rather than invalidating the other end.
+func ensureSharedMemoryFile(w ivshmemWindow) error {
+	if w.size < ivshmemMinSize {
+		return logError("ivshmem window %s: size %d is below the %d byte minimum",
+			w.id, w.size, ivshmemMinSize)
+	}
+	if w.size&(w.size-1) != 0 {
+		return logError("ivshmem window %s: size %d is not a power of two",
+			w.id, w.size)
+	}
+	f, err := os.OpenFile(w.memPath, os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return logError("ivshmem window %s: cannot open %s: %v",
+			w.id, w.memPath, err)
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return logError("ivshmem window %s: cannot stat %s: %v",
+			w.id, w.memPath, err)
+	}
+	if uint64(st.Size()) < w.size {
+		if err := f.Truncate(int64(w.size)); err != nil {
+			return logError("ivshmem window %s: cannot size %s to %d: %v",
+				w.id, w.memPath, w.size, err)
+		}
+	}
+	return nil
+}
+
+// collectIvshmemWindows returns the deduplicated set of windows requested by a
+// domain's adapter list.
+func collectIvshmemWindows(domainName string, aa *types.AssignableAdapters,
+	domainAdapterList []types.IoAdapter, domainUUID uuid.UUID) ([]ivshmemWindow, error) {
+	var windows []ivshmemWindow
+	seen := make(map[string]bool)
+	for _, adapter := range domainAdapterList {
+		aaList := aa.LookupIoBundleAny(adapter.Name)
+		if len(aaList) == 0 {
+			return nil, logError("collectIvshmemWindows: IoBundle not found %d %s for domain %s (UUID: %s)",
+				adapter.Type, adapter.Name, domainName, domainUUID)
+		}
+		for _, ib := range aaList {
+			if ib == nil {
+				continue
+			}
+			w, err := ivshmemWindowFromBundle(*ib)
+			if err != nil {
+				return nil, err
+			}
+			if w == nil || seen[w.id] {
+				continue
+			}
+			seen[w.id] = true
+			windows = append(windows, *w)
+		}
+	}
+	return windows, nil
+}
+
+// overhead for ivshmem windows. Unlike mmioVMMOverhead, which counts 1% of a
+// passthrough aperture because it is modelling page-table cost, an ivshmem
+// window is backed by real tmpfs pages that are charged in full to whichever
+// cgroup first faults them in. That is normally the QEMU container, so the
+// whole window has to be added to its limit.
+func ivshmemVMMOverhead(domainName string, aa *types.AssignableAdapters,
+	domainAdapterList []types.IoAdapter, domainUUID uuid.UUID) (int64, error) {
+	windows, err := collectIvshmemWindows(domainName, aa, domainAdapterList, domainUUID)
+	if err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, w := range windows {
+		logrus.Infof("ivshmemVMMOverhead: counting window %s (%d bytes) for domain %s",
+			w.id, w.size, domainName)
+		total += int64(w.size)
+	}
+	return total, nil
+}
+
 func estimatedVMMOverhead(domainName string, aa *types.AssignableAdapters, domainAdapterList []types.IoAdapter,
 	domainUUID uuid.UUID, domainRAMSize int64, domainMaxCpus int64, domainVcpus int64) (int64, error) {
 	var overhead int64
@@ -807,8 +1014,14 @@ func estimatedVMMOverhead(domainName string, aa *types.AssignableAdapters, domai
 		return 0, logError("mmioVMMOverhead() failed for domain %s: %v",
 			domainName, err)
 	}
+	ivshmemOverhead, err := ivshmemVMMOverhead(domainName, aa, domainAdapterList, domainUUID)
+	if err != nil {
+		return 0, logError("ivshmemVMMOverhead() failed for domain %s: %v",
+			domainName, err)
+	}
 	overhead = undefinedVMMOverhead() + ramVMMOverhead(domainRAMSize) +
-		qemuVMMOverhead() + cpuVMMOverhead(domainMaxCpus, domainVcpus) + mmioOverhead
+		qemuVMMOverhead() + cpuVMMOverhead(domainMaxCpus, domainVcpus) + mmioOverhead +
+		ivshmemOverhead
 
 	return overhead, nil
 }
@@ -1970,6 +2183,31 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 				return logError("can't write CAN Bus assignment to config file %s (%v)",
 					file.Name(), err)
 			}
+		}
+	}
+
+	// Render ivshmem windows. Uses the same collector as the VMM overhead
+	// estimator so the cgroup limit and the emitted devices cannot disagree.
+	// Goes before the vsock block below so that vsock stays last.
+	ivshmemWindows, err := collectIvshmemWindows(domainName, aa,
+		config.IoAdapterList, config.UUIDandVersion.UUID)
+	if err != nil {
+		return err
+	}
+	for _, w := range ivshmemWindows {
+		if err := ensureSharedMemoryFile(w); err != nil {
+			return err
+		}
+		logrus.Infof("Adding ivshmem window <%s> backed by %s (%d bytes)",
+			w.id, w.memPath, w.size)
+		ivshmemContext := tQemuIvshmemContext{
+			ID:      w.id,
+			MemPath: w.memPath,
+			Size:    w.size,
+		}
+		if err := tQemuIvshmem.Execute(file, ivshmemContext); err != nil {
+			return logError("can't write ivshmem assignment to config file %s (%v)",
+				file.Name(), err)
 		}
 	}
 
