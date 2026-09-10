@@ -479,7 +479,7 @@ else
             ROOTFS_MAXSIZE_MB=9999
         # nvidia platform requires more space
         else ifeq (, $(findstring nvidia,$(PLATFORM)))
-            ROOTFS_MAXSIZE_MB=290
+            ROOTFS_MAXSIZE_MB?=500
         else
             ROOTFS_MAXSIZE_MB=10240
         endif
