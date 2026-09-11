@@ -38,7 +38,10 @@ ENV GRUB_PATCHES=patches-2.12
 ENV GRUB_PLATFORM="efi pc:--disable-efiemu"
 
 FROM grub-build-base AS grub-build-arm64
-ENV GRUB_MODULES="xen_boot efi_gop gpt measurefs efinet getenv"
+ENV GRUB_MODULES_PORT="part_gpt fat ext2 squash4 gzio linux acpi normal cpio crypto disk boot crc64 \
+search_disk_uuid search_part_uuid search_part_label search_label video gfxterm serial gptprio chain probe reboot regexp smbios \
+cat echo test configfile loopback true gcry_sha256"
+ENV GRUB_MODULES="efi_gop gpt measurefs getenv"
 ENV GRUB_COMMIT=grub-2.12
 ENV GRUB_PATCHES=patches-2.12
 ENV GRUB_PLATFORM=efi

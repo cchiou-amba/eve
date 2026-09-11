@@ -1,1 +1,1 @@
-del(.services[] | select(.name == "xen-tools")) | del(.init[] | select(. == "XEN_TAG"))
+del(.init[] | select(. == "XEN_TAG"))
