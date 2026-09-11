@@ -355,3 +355,9 @@ fi
 #      mount --bind "$s" "/containers/services/$(basename "$s")/lower"
 #   fi
 # done
+
+# Ambarella Development Mode: automatically load staged out-of-tree drivers
+if [ -x "$PERSISTDIR/bin/load-ambarella-drivers.sh" ]; then
+    echo "$(date -Ins -u) Executing $PERSISTDIR/bin/load-ambarella-drivers.sh"
+    chroot /hostfs /persist/bin/load-ambarella-drivers.sh || true
+fi

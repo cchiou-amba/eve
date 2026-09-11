@@ -804,7 +804,7 @@ $(SSH_KEY):
 	ssh-keygen -P "" -f $@
 	mv $@.pub $(CONF_DIR)/authorized_keys
 
-$(CONFIG_IMG): $(CONF_FILES) | $(INSTALLER)
+$(CONFIG_IMG): $(CONF_FILES) $(LINUXKIT) | $(INSTALLER)
 	./tools/makeconfig.sh $@ "$(ROOTFS_VERSION)" $(CONF_FILES)
 	$(QUIET): $@: Succeeded
 
@@ -837,15 +837,13 @@ $(INSTALLER_TAR): images/out/installer-$(HV)-$(PLATFORM).yml $(ROOTFS_IMGS) $(PE
 	./tools/makerootfs.sh tar $(UPDATE_TAR) -y $< -t $@ -d $(INSTALLER) -a $(ZARCH)
 	$(QUIET): $@: Succeeded
 
-$(ROOTFS_IMG_BASE)-%.img: pkg/mkrootfs-$(ROOTFS_FORMAT)
-
 ifdef LIVE_UPDATE
 # Don't regenerate the whole image if tar was changed, but
 # do generate if does not exist. qcow2 target will handle
 # the rest
-$(ROOTFS_IMG_BASE)-%.img: | $(ROOTFS_TAR_BASE)-%.tar $(INSTALLER)
+$(ROOTFS_IMG_BASE)-%.img: pkg/mkrootfs-$(ROOTFS_FORMAT) | $(ROOTFS_TAR_BASE)-%.tar $(INSTALLER)
 else
-$(ROOTFS_IMG_BASE)-%.img: $(ROOTFS_TAR_BASE)-%.tar | $(INSTALLER)
+$(ROOTFS_IMG_BASE)-%.img: pkg/mkrootfs-$(ROOTFS_FORMAT) $(ROOTFS_TAR_BASE)-%.tar | $(INSTALLER)
 endif
 	$(QUIET): $@: Begin
 	echo "Building rootfs image $@ from $(ROOTFS_TAR_BASE)-$*.tar"
@@ -917,7 +915,7 @@ $(LIVE).raw: $(BOOT_PART) $(EFI_PART) $(ROOTFS_IMGS) $(CONFIG_IMG) $(PERSIST_IMG
 	./tools/makeflash.sh "mkimage-raw-efi" -C $| $@ $(LIVE_PART_SPEC)
 	$(QUIET): $@: Succeeded
 
-$(INSTALLER_IMG): $(INSTALLER_TAR) | $(INSTALLER)
+$(INSTALLER_IMG): $(INSTALLER_TAR) pkg/mkrootfs-$(ROOTFS_FORMAT) | $(INSTALLER)
 	$(QUIET): $@: Begin
 	./tools/makerootfs.sh imagefromtar -t $(INSTALLER_TAR) -i $@ -f $(ROOTFS_FORMAT) -a $(ZARCH)
 	$(QUIET): $@: Succeeded
