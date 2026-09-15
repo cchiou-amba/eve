@@ -934,13 +934,49 @@ func ensureSharedMemoryFile(w ivshmemWindow) error {
 		return logError("ivshmem window %s: size %d is not a power of two",
 			w.id, w.size)
 	}
+	st, statErr := os.Stat(w.memPath)
+	devicePath := strings.HasPrefix(w.memPath, "/dev/") &&
+		!strings.HasPrefix(w.memPath, "/dev/shm/")
+	if statErr != nil && devicePath {
+		return logError("ivshmem window %s: device backing %s is unavailable: %v",
+			w.id, w.memPath, statErr)
+	}
+	if statErr == nil && devicePath && st.Mode()&os.ModeCharDevice == 0 {
+		return logError("ivshmem window %s: device backing %s is not a character device",
+			w.id, w.memPath)
+	}
+	if statErr == nil && st.Mode()&os.ModeCharDevice != 0 {
+		f, err := os.OpenFile(w.memPath, os.O_RDWR, 0)
+		if err != nil {
+			return logError("ivshmem window %s: cannot open device %s: %v",
+				w.id, w.memPath, err)
+		}
+		defer f.Close()
+		st, err = f.Stat()
+		if err != nil {
+			return logError("ivshmem window %s: cannot stat open device %s: %v",
+				w.id, w.memPath, err)
+		}
+		if st.Mode()&os.ModeCharDevice == 0 {
+			return logError("ivshmem window %s: backing %s changed type while opening",
+				w.id, w.memPath)
+		}
+		if uint64(st.Size()) != w.size {
+			return logError("ivshmem window %s: device %s reports size %d, want %d",
+				w.id, w.memPath, st.Size(), w.size)
+		}
+		return nil
+	} else if statErr != nil && !os.IsNotExist(statErr) {
+		return logError("ivshmem window %s: cannot stat %s: %v",
+			w.id, w.memPath, statErr)
+	}
 	f, err := os.OpenFile(w.memPath, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return logError("ivshmem window %s: cannot open %s: %v",
 			w.id, w.memPath, err)
 	}
 	defer f.Close()
-	st, err := f.Stat()
+	st, err = f.Stat()
 	if err != nil {
 		return logError("ivshmem window %s: cannot stat %s: %v",
 			w.id, w.memPath, err)
@@ -997,6 +1033,13 @@ func ivshmemVMMOverhead(domainName string, aa *types.AssignableAdapters,
 	}
 	var total int64
 	for _, w := range windows {
+		if st, statErr := os.Stat(w.memPath); statErr == nil &&
+			st.Mode()&os.ModeCharDevice != 0 {
+			logrus.Infof("ivshmemVMMOverhead: window %s is PFN-backed; "+
+				"not charging %d bytes to domain %s",
+				w.id, w.size, domainName)
+			continue
+		}
 		logrus.Infof("ivshmemVMMOverhead: counting window %s (%d bytes) for domain %s",
 			w.id, w.size, domainName)
 		total += int64(w.size)

@@ -160,6 +160,14 @@ func TestEnsureSharedMemoryFile(t *testing.T) {
 	if st, _ := os.Stat(path); st.Size() != 32<<20 {
 		t.Errorf("file shrank to %d bytes, want it left at %d", st.Size(), 32<<20)
 	}
+
+	// PFN-backed windows are character devices. They must be opened as-is
+	// and report the configured size; /dev/null deliberately reports zero.
+	if err := ensureSharedMemoryFile(ivshmemWindow{
+		id: "pfn", memPath: "/dev/null", size: 16 << 20,
+	}); err == nil {
+		t.Error("character-device size mismatch was accepted")
+	}
 }
 
 // The ivshmem stanza has to land before the vsock device, which CreateDomConfig
@@ -274,5 +282,14 @@ func TestIvshmemVMMOverhead(t *testing.T) {
 	}
 	if got != 0 {
 		t.Errorf("ivshmemVMMOverhead = %d for a domain with no windows, want 0", got)
+	}
+
+	aa.IoBundleList[0].Cbattr["shmpath"] = "/dev/null"
+	got, err = ivshmemVMMOverhead(DefaultDomainName, &aa, adapters, id)
+	if err != nil {
+		t.Fatalf("ivshmemVMMOverhead for PFN window failed: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("ivshmemVMMOverhead = %d for PFN-backed window, want 0", got)
 	}
 }
