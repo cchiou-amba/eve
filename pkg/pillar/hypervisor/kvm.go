@@ -548,6 +548,19 @@ const qemuIvshmemTemplate = `
   memdev = "{{.ID}}"
 `
 
+// ivshmem-doorbell connects to a host UNIX socket server to receive the MMIO
+// BAR backing file descriptor and MSI-X eventfds for guest interrupt injection.
+const qemuIvshmemDoorbellTemplate = `
+[chardev "ivs-chardev-{{.ID}}"]
+  backend = "socket"
+  path = "{{.SocketPath}}"
+
+[device "{{.ID}}-dev"]
+  driver = "ivshmem-doorbell"
+  chardev = "ivs-chardev-{{.ID}}"
+  vectors = "{{.Vectors}}"
+`
+
 const qemuSwtpmTemplate = `
 [chardev "swtpm"]
   backend = "socket"
@@ -651,11 +664,18 @@ type tQemuIvshmemContext struct {
 	Size    uint64
 }
 
+// Context for qemuIvshmemDoorbellTemplate.
+type tQemuIvshmemDoorbellContext struct {
+	ID         string
+	SocketPath string
+	Vectors    int
+}
+
 var (
 	tQemuGlobalConf, tQemuSwtmp, tQemuVsock              *template.Template
 	tQemuPCIeBridge, tQemuPCIPassthru, tQemuPCIeRootPort *template.Template
 	tQemuDisk, tQemuNet, tQemuSerial, tQemuCANBus        *template.Template
-	tQemuIvshmem                                         *template.Template
+	tQemuIvshmem, tQemuIvshmemDoorbell                   *template.Template
 )
 
 // Initialize all Go templates used to generate qemu config file.
@@ -676,6 +696,10 @@ func init() {
 	tQemuIvshmem, err = template.New("qemuIvshmem").Parse(qemuIvshmemTemplate)
 	if err != nil {
 		panic(fmt.Errorf("parsing qemuIvshmemTemplate failed: %w", err))
+	}
+	tQemuIvshmemDoorbell, err = template.New("qemuIvshmemDoorbell").Parse(qemuIvshmemDoorbellTemplate)
+	if err != nil {
+		panic(fmt.Errorf("parsing qemuIvshmemDoorbellTemplate failed: %w", err))
 	}
 	tQemuPCIeBridge, err = template.New("qemuPCIeBridge").Parse(qemuPCIeBridgeTemplate)
 	if err != nil {
@@ -824,9 +848,10 @@ func (ctx KvmContext) Task(status *types.DomainStatus) types.Task {
 }
 
 const (
-	// Model cbattr keys parameterising an ivshmem window.
+	// Model cbattr keys parameterising an ivshmem window or UART adapter.
 	ivshmemCbattrPath = "shmpath"
 	ivshmemCbattrSize = "shmsize"
+	uartCbattrKey     = "uart"
 	// Used when the model declares a window but gives no size.
 	ivshmemDefaultSize = uint64(16 << 20)
 	// Where a window path is derived when the model carries no shmpath.
@@ -842,6 +867,14 @@ type ivshmemWindow struct {
 	id      string
 	memPath string
 	size    uint64
+}
+
+// uartAdapter is one virtualized physical UART adapter to expose to a domain via ivshmem-doorbell.
+type uartAdapter struct {
+	id         string
+	uartID     string
+	socketPath string
+	devPath    string
 }
 
 // parseIvshmemSize accepts a plain byte count or a K/M/G suffixed size.
@@ -897,22 +930,112 @@ func ivshmemWindowFromBundle(ib types.IoBundle) (*ivshmemWindow, error) {
 	if label == "" {
 		return nil, nil
 	}
+
+	// Mutual exclusion: UART bundles are recognized by the UART parser, not the bulk window parser.
+	uartAttr := ib.Cbattr[uartCbattrKey]
+	shmPath := ib.Cbattr[ivshmemCbattrPath]
+	shmSize := ib.Cbattr[ivshmemCbattrSize]
+
+	if uartAttr != "" && (shmPath != "" || shmSize != "") {
+		return nil, logError("ivshmem window %s: cannot combine uart attribute with shmpath/shmsize", label)
+	}
+	if uartAttr != "" {
+		return nil, nil
+	}
+
 	w := ivshmemWindow{
 		id:      label,
 		memPath: filepath.Join(ivshmemDefaultDir, label),
 		size:    ivshmemDefaultSize,
 	}
-	if p := ib.Cbattr[ivshmemCbattrPath]; p != "" {
-		w.memPath = p
+	if shmPath != "" {
+		w.memPath = shmPath
 	}
-	if s := ib.Cbattr[ivshmemCbattrSize]; s != "" {
-		size, err := parseIvshmemSize(s)
+	if shmSize != "" {
+		size, err := parseIvshmemSize(shmSize)
 		if err != nil {
 			return nil, logError("ivshmem window %s: %v", label, err)
 		}
 		w.size = size
 	}
 	return &w, nil
+}
+
+// uartAdapterFromBundle recognises an IoBundle declaring an Ambarella UART adapter
+// via `cbattr: {"uart": "<id>"}`.
+func uartAdapterFromBundle(ib types.IoBundle) (*uartAdapter, error) {
+	if ib.Type != types.IoOther {
+		return nil, nil
+	}
+	if ib.PciLong != "" || ib.Ifname != "" || ib.Serial != "" || ib.UsbAddr != "" {
+		return nil, nil
+	}
+	label := ib.Logicallabel
+	if label == "" {
+		label = ib.Phylabel
+	}
+	if label == "" {
+		return nil, nil
+	}
+
+	uartAttr := ib.Cbattr[uartCbattrKey]
+	if uartAttr == "" {
+		return nil, nil
+	}
+
+	shmPath := ib.Cbattr[ivshmemCbattrPath]
+	shmSize := ib.Cbattr[ivshmemCbattrSize]
+	if shmPath != "" || shmSize != "" {
+		return nil, logError("uart adapter %s: cannot combine uart attribute with shmpath/shmsize", label)
+	}
+
+	// UART0 is host management console (not guest assigned).
+	if uartAttr == "0" {
+		return nil, nil
+	}
+
+	// Validate supported UART IDs (1, 2, 3, 4).
+	idNum, err := strconv.Atoi(uartAttr)
+	if err != nil || idNum < 1 || idNum > 4 {
+		return nil, logError("uart adapter %s: unsupported uart ID %q", label, uartAttr)
+	}
+
+	return &uartAdapter{
+		id:         label,
+		uartID:     uartAttr,
+		socketPath: fmt.Sprintf("/run/amba_virt_uart%s.sock", uartAttr),
+		devPath:    fmt.Sprintf("/dev/amba_virt_uart%s", uartAttr),
+	}, nil
+}
+
+// collectUartAdapters returns the deduplicated set of UART adapters requested by a
+// domain's adapter list.
+func collectUartAdapters(domainName string, aa *types.AssignableAdapters,
+	domainAdapterList []types.IoAdapter, domainUUID uuid.UUID) ([]uartAdapter, error) {
+	var uarts []uartAdapter
+	seen := make(map[string]bool)
+	for _, adapter := range domainAdapterList {
+		aaList := aa.LookupIoBundleAny(adapter.Name)
+		if len(aaList) == 0 {
+			return nil, logError("collectUartAdapters: IoBundle not found %d %s for domain %s (UUID: %s)",
+				adapter.Type, adapter.Name, domainName, domainUUID)
+		}
+		for _, ib := range aaList {
+			if ib == nil {
+				continue
+			}
+			u, err := uartAdapterFromBundle(*ib)
+			if err != nil {
+				return nil, err
+			}
+			if u == nil || seen[u.id] {
+				continue
+			}
+			seen[u.id] = true
+			uarts = append(uarts, *u)
+		}
+	}
+	return uarts, nil
 }
 
 // ensureSharedMemoryFile creates and sizes the ivshmem backing file.
@@ -961,7 +1084,9 @@ func ensureSharedMemoryFile(w ivshmemWindow) error {
 			return logError("ivshmem window %s: backing %s changed type while opening",
 				w.id, w.memPath)
 		}
-		if uint64(st.Size()) != w.size {
+		// On Linux, character device nodes (/dev/amba_virt_shm) report st_size == 0;
+		// size is managed by the underlying driver and mmap remap_pfn_range.
+		if st.Size() != 0 && uint64(st.Size()) != w.size {
 			return logError("ivshmem window %s: device %s reports size %d, want %d",
 				w.id, w.memPath, st.Size(), w.size)
 		}
@@ -2250,6 +2375,26 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 		}
 		if err := tQemuIvshmem.Execute(file, ivshmemContext); err != nil {
 			return logError("can't write ivshmem assignment to config file %s (%v)",
+				file.Name(), err)
+		}
+	}
+
+	// Render UART ivshmem-doorbell adapters.
+	uartAdapters, err := collectUartAdapters(domainName, aa,
+		config.IoAdapterList, config.UUIDandVersion.UUID)
+	if err != nil {
+		return err
+	}
+	for _, u := range uartAdapters {
+		logrus.Infof("Adding UART ivshmem-doorbell <%s> (uart%s) on socket %s",
+			u.id, u.uartID, u.socketPath)
+		uartContext := tQemuIvshmemDoorbellContext{
+			ID:         u.id,
+			SocketPath: u.socketPath,
+			Vectors:    1,
+		}
+		if err := tQemuIvshmemDoorbell.Execute(file, uartContext); err != nil {
+			return logError("can't write UART ivshmem-doorbell assignment to config file %s (%v)",
 				file.Name(), err)
 		}
 	}

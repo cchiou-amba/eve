@@ -161,12 +161,12 @@ func TestEnsureSharedMemoryFile(t *testing.T) {
 		t.Errorf("file shrank to %d bytes, want it left at %d", st.Size(), 32<<20)
 	}
 
-	// PFN-backed windows are character devices. They must be opened as-is
-	// and report the configured size; /dev/null deliberately reports zero.
+	// PFN-backed windows are character devices (e.g. /dev/amba_virt_shm).
+	// They must be openable without error even if st_size is 0.
 	if err := ensureSharedMemoryFile(ivshmemWindow{
 		id: "pfn", memPath: "/dev/null", size: 16 << 20,
-	}); err == nil {
-		t.Error("character-device size mismatch was accepted")
+	}); err != nil {
+		t.Errorf("character-device backing failed: %v", err)
 	}
 }
 
@@ -291,5 +291,186 @@ func TestIvshmemVMMOverhead(t *testing.T) {
 	}
 	if got != 0 {
 		t.Errorf("ivshmemVMMOverhead = %d for PFN-backed window, want 0", got)
+	}
+}
+
+func TestUartAdapterFromBundle(t *testing.T) {
+	t.Parallel()
+
+	// Valid UART2 bundle (Ubuntu HVM target).
+	u, err := uartAdapterFromBundle(types.IoBundle{
+		Type:         types.IoOther,
+		Phylabel:     "UART2",
+		Logicallabel: "UART2",
+		Cbattr: map[string]string{
+			"uart": "2",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if u == nil {
+		t.Fatal("expected a uartAdapter for UART2 bundle")
+	}
+	if u.id != "UART2" || u.uartID != "2" || u.socketPath != "/run/amba_virt_uart2.sock" || u.devPath != "/dev/amba_virt_uart2" {
+		t.Errorf("got %+v, want id=UART2 uartID=2 socketPath=/run/amba_virt_uart2.sock devPath=/dev/amba_virt_uart2", *u)
+	}
+
+	// Valid UART3 bundle (QNX HVM target).
+	u, err = uartAdapterFromBundle(types.IoBundle{
+		Type:         types.IoOther,
+		Phylabel:     "UART3",
+		Logicallabel: "UART3",
+		Cbattr: map[string]string{
+			"uart": "3",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if u == nil || u.uartID != "3" || u.socketPath != "/run/amba_virt_uart3.sock" {
+		t.Errorf("got %+v, want uartID=3", *u)
+	}
+
+	// UART0 is host management console (filtered from guest HVM).
+	u, err = uartAdapterFromBundle(types.IoBundle{
+		Type:         types.IoOther,
+		Phylabel:     "UART0",
+		Logicallabel: "UART0",
+		Cbattr: map[string]string{
+			"uart": "0",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if u != nil {
+		t.Errorf("expected UART0 to be filtered from guest assignment, got %+v", *u)
+	}
+
+	// Mutual exclusion: UART bundles must NOT be treated as bulk shared-memory windows.
+	w, err := ivshmemWindowFromBundle(types.IoBundle{
+		Type:         types.IoOther,
+		Phylabel:     "UART2",
+		Logicallabel: "UART2",
+		Cbattr: map[string]string{
+			"uart": "2",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if w != nil {
+		t.Errorf("UART bundle was wrongly treated as a bulk shared-memory window: %+v", *w)
+	}
+
+	// Bulk shared-memory window must NOT be treated as a UART adapter.
+	u, err = uartAdapterFromBundle(types.IoBundle{
+		Type:         types.IoOther,
+		Phylabel:     "amba_shm",
+		Logicallabel: "amba_shm",
+		Cbattr: map[string]string{
+			"shmpath": "/dev/amba_virt_shm",
+			"shmsize": "1G",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if u != nil {
+		t.Errorf("bulk shm bundle was wrongly treated as a UART adapter: %+v", *u)
+	}
+
+	// Conflicting attributes: combining uart with shmpath/shmsize must fail.
+	_, err = ivshmemWindowFromBundle(types.IoBundle{
+		Type:         types.IoOther,
+		Phylabel:     "bad_uart",
+		Logicallabel: "bad_uart",
+		Cbattr: map[string]string{
+			"uart":    "2",
+			"shmpath": "/dev/shm/foo",
+		},
+	})
+	if err == nil {
+		t.Error("expected error when combining uart and shmpath in ivshmemWindowFromBundle")
+	}
+
+	_, err = uartAdapterFromBundle(types.IoBundle{
+		Type:         types.IoOther,
+		Phylabel:     "bad_uart",
+		Logicallabel: "bad_uart",
+		Cbattr: map[string]string{
+			"uart":    "2",
+			"shmpath": "/dev/shm/foo",
+		},
+	})
+	if err == nil {
+		t.Error("expected error when combining uart and shmpath in uartAdapterFromBundle")
+	}
+
+	// Unsupported UART ID (e.g. 5).
+	_, err = uartAdapterFromBundle(types.IoBundle{
+		Type:         types.IoOther,
+		Phylabel:     "bad_uart",
+		Logicallabel: "bad_uart",
+		Cbattr: map[string]string{
+			"uart": "5",
+		},
+	})
+	if err == nil {
+		t.Error("expected error for unsupported uart ID 5")
+	}
+}
+
+func TestCreateDomConfigWithUart(t *testing.T) {
+	t.Parallel()
+
+	conf, err := os.CreateTemp("/tmp", "config")
+	if err != nil {
+		t.Fatalf("can't create config file for a domain %v", err)
+	}
+	defer os.Remove(conf.Name())
+
+	diskConfigs, diskStatuses := qemuDisks()
+	config, aa := domainConfigAndAssignableAdapters(diskConfigs)
+	config.VirtualizationMode = types.HVM
+
+	config.IoAdapterList = append(config.IoAdapterList, types.IoAdapter{
+		Type: types.IoOther,
+		Name: "UART2",
+	})
+	aa.IoBundleList = append(aa.IoBundleList, types.IoBundle{
+		Type:            types.IoOther,
+		AssignmentGroup: "uart2",
+		Phylabel:        "UART2",
+		Logicallabel:    "UART2",
+		Cbattr:          map[string]string{"uart": "2"},
+		UsedByUUID:      config.UUIDandVersion.UUID,
+	})
+
+	if err := kvmArm.CreateDomConfig(DefaultDomainName, config, types.DomainStatus{},
+		diskStatuses, &aa, nil, swtpmCtrlSock, conf); err != nil {
+		t.Fatalf("CreateDomConfig failed %v", err)
+	}
+	defer os.Truncate(conf.Name(), 0)
+
+	result, err := os.ReadFile(conf.Name())
+	if err != nil {
+		t.Fatalf("reading conf file failed %v", err)
+	}
+	got := string(result)
+
+	for _, want := range []string{
+		`[chardev "ivs-chardev-UART2"]`,
+		`backend = "socket"`,
+		`path = "/run/amba_virt_uart2.sock"`,
+		`[device "UART2-dev"]`,
+		`driver = "ivshmem-doorbell"`,
+		`chardev = "ivs-chardev-UART2"`,
+		`vectors = "1"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("generated config is missing %q:\n%s", want, got)
+		}
 	}
 }
