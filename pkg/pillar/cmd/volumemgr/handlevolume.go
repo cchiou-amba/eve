@@ -105,7 +105,9 @@ func handleDeferredVolumeCreate(ctx *volumemgrContext, key string, config *types
 			// Objects are replicated across cluster nodes, just exit.
 			return
 		}
-		log.Fatalf("status exists at handleVolumeCreate for %s", config.Key())
+		log.Warnf("status exists at handleVolumeCreate for %s, modifying instead", config.Key())
+		handleVolumeModify(ctx, key, *config, *config)
+		return
 	}
 	status = &types.VolumeStatus{
 		VolumeID:                config.VolumeID,

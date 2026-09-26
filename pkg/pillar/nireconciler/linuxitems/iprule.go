@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 
 	dg "github.com/lf-edge/eve-libs/depgraph"
 	"github.com/lf-edge/eve/pkg/pillar/base"
@@ -126,7 +127,7 @@ func (c *IPRuleConfigurator) Create(ctx context.Context, item dg.Item) error {
 	}
 	netlinkRule := c.makeNetlinkRule(rule)
 	err := netlink.RuleAdd(netlinkRule)
-	if err != nil {
+	if err != nil && !strings.Contains(err.Error(), "file exists") {
 		err = fmt.Errorf("failed to add IP rule %+v: %w", netlinkRule, err)
 		c.Log.Error(err)
 		return err

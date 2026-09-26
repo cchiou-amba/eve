@@ -19,7 +19,9 @@ func handleVolumeRefCreate(ctxArg interface{}, key string,
 	ctx := ctxArg.(*volumemgrContext)
 	vrs := lookupVolumeRefStatus(ctx, key)
 	if vrs != nil {
-		log.Fatalf("VolumeRefStatus exists at handleVolumeRefCreate for %s", key)
+		log.Warnf("VolumeRefStatus exists at handleVolumeRefCreate for %s, modifying instead", key)
+		handleVolumeRefModify(ctxArg, key, configArg, configArg)
+		return
 	}
 	needUpdateVol := false
 	vs := ctx.LookupVolumeStatus(config.VolumeKey())

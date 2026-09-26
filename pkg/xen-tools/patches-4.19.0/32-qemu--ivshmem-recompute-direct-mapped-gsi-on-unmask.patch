@@ -1,0 +1,47 @@
+diff --git a/tools/qemu-xen/hw/misc/ivshmem.c b/tools/qemu-xen/hw/misc/ivshmem.c
+index d66d912172..6a73398e2f 100644
+--- a/tools/qemu-xen/hw/misc/ivshmem.c
++++ b/tools/qemu-xen/hw/misc/ivshmem.c
+@@ -272,6 +272,11 @@ static void ivshmem_vector_notify(void *opaque)
+     }
+ }
+ 
++int __attribute__((weak)) kvm_arch_msi_data_to_gsi(uint32_t data)
++{
++    return -ENOSYS;
++}
++
+ static int ivshmem_vector_unmask(PCIDevice *dev, unsigned vector,
+                                  MSIMessage msg)
+ {
+@@ -287,6 +292,21 @@ static int ivshmem_vector_unmask(PCIDevice *dev, unsigned vector,
+     }
+     assert(!v->unmasked);
+ 
++    if (kvm_gsi_direct_mapping()) {
++        /*
++         * Under direct GSI mapping the GSI is derived from the MSI data
++         * word, which was still zero when the route was created at
++         * MSI-X enable time. Re-derive it now that the guest has
++         * programmed the vector table.
++         */
++        if (msg.data >= 32) {
++            v->virq = kvm_arch_msi_data_to_gsi(msg.data);
++        } else {
++            error_report("ivshmem: invalid direct-mapped MSI data 0x%x (must be >= 32)", msg.data);
++            return -EINVAL;
++        }
++    }
++
+     ret = kvm_irqchip_update_msi_route(kvm_state, v->virq, msg, dev);
+     if (ret < 0) {
+         return ret;
+@@ -295,6 +315,8 @@ static int ivshmem_vector_unmask(PCIDevice *dev, unsigned vector,
+ 
+     ret = kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, n, NULL, v->virq);
+     if (ret < 0) {
++        error_report("ivshmem: add_irqfd_notifier_gsi GSI %d failed: %d",
++                     v->virq, ret);
+         return ret;
+     }
+     v->unmasked = true;

@@ -1,0 +1,75 @@
+diff --git a/tools/qemu-xen/hw/core/sysbus-fdt.c b/tools/qemu-xen/hw/core/sysbus-fdt.c
+index eebcd28f9a..b4712e1987 100644
+--- a/tools/qemu-xen/hw/core/sysbus-fdt.c
++++ b/tools/qemu-xen/hw/core/sysbus-fdt.c
+@@ -433,6 +433,62 @@ static bool vfio_platform_match(SysBusDevice *sbdev,
+     return false;
+ }
+ 
++/**
++ * add_ambarella_uart_fdt_node
++ *
++ * Generates an Ambarella UART FDT node on dynamic platform bus:
++ * - compatible = "ambarella,uart"
++ * - reg = exactly 4 KiB MMIO region
++ * - interrupts = level-high SPI
++ * - reg-shift = 2, reg-io-width = 4, clock-frequency = 24 MHz
++ */
++static int add_ambarella_uart_fdt_node(SysBusDevice *sbdev, void *opaque)
++{
++    PlatformBusFDTData *data = opaque;
++    PlatformBusDevice *pbus = data->pbus;
++    void *fdt = data->fdt;
++    const char *parent_node = data->pbus_node_name;
++    char *nodename;
++    uint32_t *irq_attr, reg_attr[2];
++    uint64_t mmio_base, irq_number;
++    VFIOPlatformDevice *vdev = VFIO_PLATFORM_DEVICE(sbdev);
++    VFIODevice *vbasedev = &vdev->vbasedev;
++
++    /* Enforce 4 KiB aperture limit (Task 3.3) */
++    if (vbasedev->num_regions < 1 || memory_region_size(vdev->regions[0]->mem) != 0x1000) {
++        error_report("%s: UART region size mismatch (want 4096, got %" PRIu64 ")",
++                     __func__, (uint64_t)memory_region_size(vdev->regions[0]->mem));
++        return -EINVAL;
++    }
++
++    mmio_base = platform_bus_get_mmio_addr(pbus, sbdev, 0);
++    nodename = g_strdup_printf("%s/uart@%" PRIx64, parent_node, mmio_base);
++    qemu_fdt_add_subnode(fdt, nodename);
++
++    qemu_fdt_setprop_string(fdt, nodename, "compatible", "ambarella,uart");
++
++    reg_attr[0] = cpu_to_be32(mmio_base);
++    reg_attr[1] = cpu_to_be32(0x1000);
++    qemu_fdt_setprop(fdt, nodename, "reg", reg_attr, sizeof(reg_attr));
++
++    if (vbasedev->num_irqs > 0) {
++        irq_number = platform_bus_get_irqn(pbus, sbdev, 0) + data->irq_start;
++        irq_attr = g_new(uint32_t, 3);
++        irq_attr[0] = cpu_to_be32(GIC_FDT_IRQ_TYPE_SPI);
++        irq_attr[1] = cpu_to_be32(irq_number);
++        irq_attr[2] = cpu_to_be32(GIC_FDT_IRQ_FLAGS_LEVEL_HI);
++        qemu_fdt_setprop(fdt, nodename, "interrupts", irq_attr, 3 * sizeof(uint32_t));
++        g_free(irq_attr);
++    }
++
++    qemu_fdt_setprop_cell(fdt, nodename, "reg-shift", 2);
++    qemu_fdt_setprop_cell(fdt, nodename, "reg-io-width", 4);
++    qemu_fdt_setprop_cell(fdt, nodename, "clock-frequency", 24000000);
++
++    g_free(nodename);
++    return 0;
++}
++
+ #define VFIO_PLATFORM_BINDING(compat, add_fn) \
+     {TYPE_VFIO_PLATFORM, (compat), (add_fn), vfio_platform_match}
+ 
+@@ -490,6 +546,7 @@ static const BindingEntry bindings[] = {
+     TYPE_BINDING(TYPE_VFIO_CALXEDA_XGMAC, add_calxeda_midway_xgmac_fdt_node),
+     TYPE_BINDING(TYPE_VFIO_AMD_XGBE, add_amd_xgbe_fdt_node),
+     VFIO_PLATFORM_BINDING("amd,xgbe-seattle-v1a", add_amd_xgbe_fdt_node),
++    VFIO_PLATFORM_BINDING("ambarella,uart", add_ambarella_uart_fdt_node),
+ #endif
+ #ifdef CONFIG_TPM
+     TYPE_BINDING(TYPE_TPM_TIS_SYSBUS, add_tpm_tis_fdt_node),

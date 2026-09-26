@@ -1,0 +1,245 @@
+diff --git a/tools/qemu-xen/include/hw/vfio/vfio-platform-sysbus.h b/tools/qemu-xen/include/hw/vfio/vfio-platform-sysbus.h
+new file mode 100644
+index 0000000000..f7f6f1c4e1
+--- /dev/null
++++ b/tools/qemu-xen/include/hw/vfio/vfio-platform-sysbus.h
+@@ -0,0 +1,24 @@
++/*
++ * vfio-platform-sysbus.h
++ *
++ * Copyright (C) 2026, Ambarella International LLC.
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or later.
++ * See the COPYING file in the top-level directory.
++ */
++
++#ifndef HW_VFIO_VFIO_PLATFORM_SYSBUS_H
++#define HW_VFIO_VFIO_PLATFORM_SYSBUS_H
++
++#include "hw/sysbus.h"
++
++#ifdef CONFIG_LINUX
++bool vfio_platform_device_has_compatible(SysBusDevice *sbdev,
++                                         const char *compatible);
++#else
++static inline bool vfio_platform_device_has_compatible(SysBusDevice *sbdev,
++                                                       const char *compatible)
++{
++    return false;
++}
++#endif
++
++#endif /* HW_VFIO_VFIO_PLATFORM_SYSBUS_H */
+diff --git a/tools/qemu-xen/include/hw/vfio/vfio-platform.h b/tools/qemu-xen/include/hw/vfio/vfio-platform.h
+index c414c3dffc..610ca57170 100644
+--- a/tools/qemu-xen/include/hw/vfio/vfio-platform.h
++++ b/tools/qemu-xen/include/hw/vfio/vfio-platform.h
+@@ -18,6 +18,7 @@
+ 
+ #include "hw/sysbus.h"
+ #include "hw/vfio/vfio-common.h"
++#include "hw/vfio/vfio-platform-sysbus.h"
+ #include "qemu/event_notifier.h"
+ #include "qemu/queue.h"
+ #include "qom/object.h"
+diff --git a/tools/qemu-xen/hw/vfio/platform.c b/tools/qemu-xen/hw/vfio/platform.c
+index 5af73f9287..9929f79643 100644
+--- a/tools/qemu-xen/hw/vfio/platform.c
++++ b/tools/qemu-xen/hw/vfio/platform.c
+@@ -718,3 +718,30 @@ static void register_vfio_platform_dev_type(void)
+ }
+ 
+ type_init(register_vfio_platform_dev_type)
++
++bool vfio_platform_device_has_compatible(SysBusDevice *sbdev,
++                                         const char *compatible)
++{
++    VFIOPlatformDevice *vdev;
++    const char *compat;
++    int n;
++
++    if (!sbdev || !compatible) {
++        return false;
++    }
++
++    if (!object_dynamic_cast(OBJECT(sbdev), TYPE_VFIO_PLATFORM)) {
++        return false;
++    }
++
++    vdev = VFIO_PLATFORM_DEVICE(sbdev);
++    for (n = vdev->num_compat, compat = vdev->compat; n > 0;
++         n--, compat += strlen(compat) + 1) {
++        if (!strcmp(compatible, compat)) {
++            return true;
++        }
++    }
++
++    return false;
++}
++
+diff --git a/tools/qemu-xen/hw/core/sysbus-fdt.c b/tools/qemu-xen/hw/core/sysbus-fdt.c
+index eebcd28f9a..a5d5d62471 100644
+--- a/tools/qemu-xen/hw/core/sysbus-fdt.c
++++ b/tools/qemu-xen/hw/core/sysbus-fdt.c
+@@ -419,18 +419,7 @@ static int add_amd_xgbe_fdt_node(SysBusDevice *sbdev, void *opaque)
+ static bool vfio_platform_match(SysBusDevice *sbdev,
+                                 const BindingEntry *entry)
+ {
+-    VFIOPlatformDevice *vdev = VFIO_PLATFORM_DEVICE(sbdev);
+-    const char *compat;
+-    unsigned int n;
+-
+-    for (n = vdev->num_compat, compat = vdev->compat; n > 0;
+-         n--, compat += strlen(compat) + 1) {
+-        if (!strcmp(entry->compat, compat)) {
+-            return true;
+-        }
+-    }
+-
+-    return false;
++    return vfio_platform_device_has_compatible(sbdev, entry->compat);
+ }
+ 
+ /**
+diff --git a/tools/qemu-xen/hw/arm/virt-acpi-build.c b/tools/qemu-xen/hw/arm/virt-acpi-build.c
+index 4156111d49..a2c254de7d 100644
+--- a/tools/qemu-xen/hw/arm/virt-acpi-build.c
++++ b/tools/qemu-xen/hw/arm/virt-acpi-build.c
+@@ -50,6 +50,7 @@
+ #include "hw/arm/virt.h"
+ #include "hw/mem/nvdimm.h"
+ #include "hw/platform-bus.h"
++#include "hw/vfio/vfio-platform-sysbus.h"
+ #include "sysemu/numa.h"
+ #include "sysemu/reset.h"
+ #include "sysemu/tpm.h"
+@@ -93,6 +94,112 @@ static void acpi_dsdt_add_uart(Aml *scope, const MemMapEntry *uart_memmap,
+     aml_append(scope, dev);
+ }
+ 
++typedef struct DynamicSysbusAcpiContext {
++    VirtMachineState *vms;
++    Aml *scope;
++    PlatformBusDevice *pbus;
++    uint32_t uart_count;
++} DynamicSysbusAcpiContext;
++
++static void acpi_dsdt_add_amba_uart(SysBusDevice *sbdev, void *opaque)
++{
++    DynamicSysbusAcpiContext *ctx = opaque;
++    VirtMachineState *vms = ctx->vms;
++    PlatformBusDevice *pbus = ctx->pbus;
++    Aml *scope = ctx->scope;
++    MemoryRegion *mr;
++    hwaddr mmio_offset, absolute_gpa;
++    int irqn;
++    uint32_t intid;
++    char nameseg[5];
++    Aml *dev, *crs, *dsd, *props_list, *prop_io_width, *prop_clk;
++
++    if (!vfio_platform_device_has_compatible(sbdev, "ambarella,uart")) {
++        return;
++    }
++
++    if (ctx->uart_count >= 10) {
++        error_setg(&error_fatal,
++                   "Too many Ambarella UART devices (maximum 10: URT0-URT9)");
++        return;
++    }
++
++    /* Require MMIO region 0 to exist and have size exactly 0x1000 */
++    if (sbdev->num_mmio < 1) {
++        error_setg(&error_fatal, "Ambarella UART device has no MMIO regions");
++        return;
++    }
++
++    mr = sysbus_mmio_get_region(sbdev, 0);
++    if (!mr || memory_region_size(mr) != 0x1000) {
++        error_setg(&error_fatal,
++                   "Ambarella UART region size mismatch (want 0x1000, got 0x%" PRIx64 ")",
++                   mr ? (uint64_t)memory_region_size(mr) : 0);
++        return;
++    }
++
++    mmio_offset = platform_bus_get_mmio_addr(pbus, sbdev, 0);
++    if (mmio_offset == (hwaddr)-1) {
++        error_setg(&error_fatal,
++                   "Ambarella UART MMIO region 0 not mapped on platform bus");
++        return;
++    }
++
++    absolute_gpa = vms->memmap[VIRT_PLATFORM_BUS].base + mmio_offset;
++    if (absolute_gpa + 0x1000 > UINT32_MAX) {
++        error_setg(&error_fatal,
++                   "Ambarella UART absolute GPA 0x%" PRIx64 " does not fit in Memory32Fixed",
++                   absolute_gpa);
++        return;
++    }
++
++    irqn = platform_bus_get_irqn(pbus, sbdev, 0);
++    if (irqn < 0) {
++        error_setg(&error_fatal,
++                   "Ambarella UART IRQ 0 not mapped on platform bus");
++        return;
++    }
++
++    intid = ARM_SPI_BASE + vms->irqmap[VIRT_PLATFORM_BUS] + irqn;
++
++    snprintf(nameseg, sizeof(nameseg), "URT%u", ctx->uart_count);
++    dev = aml_device("%s", nameseg);
++    aml_append(dev, aml_name_decl("_HID", aml_string("AMBA0001")));
++    aml_append(dev, aml_name_decl("_UID", aml_int(ctx->uart_count)));
++
++    crs = aml_resource_template();
++    aml_append(crs, aml_memory32_fixed((uint32_t)absolute_gpa, 0x1000, AML_READ_WRITE));
++    aml_append(crs, aml_interrupt(AML_CONSUMER, AML_LEVEL, AML_ACTIVE_HIGH,
++                                  AML_EXCLUSIVE, &intid, 1));
++    aml_append(dev, aml_name_decl("_CRS", crs));
++
++    /*
++     * _DSD Device Properties UUID: daffd814-6eba-4d8c-8a91-bc9bbf4aa301
++     * Properties:
++     *   "reg-io-width" = 4
++     *   "clock-frequency" = 24000000
++     */
++    prop_io_width = aml_package(2);
++    aml_append(prop_io_width, aml_string("reg-io-width"));
++    aml_append(prop_io_width, aml_int(4));
++
++    prop_clk = aml_package(2);
++    aml_append(prop_clk, aml_string("clock-frequency"));
++    aml_append(prop_clk, aml_int(24000000));
++
++    props_list = aml_package(2);
++    aml_append(props_list, prop_io_width);
++    aml_append(props_list, prop_clk);
++
++    dsd = aml_package(2);
++    aml_append(dsd, aml_touuid("DAFFD814-6EBA-4D8C-8A91-BC9BBF4AA301"));
++    aml_append(dsd, props_list);
++    aml_append(dev, aml_name_decl("_DSD", dsd));
++
++    aml_append(scope, dev);
++    ctx->uart_count++;
++}
++
+ static void acpi_dsdt_add_fw_cfg(Aml *scope, const MemMapEntry *fw_cfg_memmap)
+ {
+     Aml *dev = aml_device("FWCF");
+@@ -893,6 +1000,16 @@ build_dsdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
+     acpi_dsdt_add_tpm(scope, vms);
+ #endif
+ 
++    if (vms->platform_bus_dev) {
++        DynamicSysbusAcpiContext ctx = {
++            .vms = vms,
++            .scope = scope,
++            .pbus = PLATFORM_BUS_DEVICE(vms->platform_bus_dev),
++            .uart_count = 0,
++        };
++        foreach_dynamic_sysbus_device(acpi_dsdt_add_amba_uart, &ctx);
++    }
++
+     aml_append(dsdt, scope);
+ 
+     /* copy AML table into ACPI tables blob */

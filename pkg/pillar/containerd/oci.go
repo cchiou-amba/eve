@@ -343,7 +343,9 @@ func (s *ociSpec) UpdateWithIoBundles(config *types.DomainConfig, aa *types.Assi
 
 		if len(list) == 0 {
 			// We reserved it in handleCreate so nobody could have stolen it
-			logrus.Fatalf("IoBundle disappeared %d %s for %v\n",
+			logrus.Errorf("IoBundle disappeared %d %s for %v\n",
+				adapter.Type, adapter.Name, domainID)
+			return fmt.Errorf("IoBundle disappeared %d %s for %v",
 				adapter.Type, adapter.Name, domainID)
 		}
 		for _, ib := range list {
@@ -351,7 +353,10 @@ func (s *ociSpec) UpdateWithIoBundles(config *types.DomainConfig, aa *types.Assi
 				continue
 			}
 			if ib.UsedByUUID != config.UUIDandVersion.UUID {
-				logrus.Fatalf("IoBundle not ours %s: %d %s for %v\n",
+				logrus.Errorf("IoBundle not ours %s: %d %s for %v\n",
+					ib.UsedByUUID, adapter.Type, adapter.Name,
+					domainID)
+				return fmt.Errorf("IoBundle not ours %s: %d %s for %v",
 					ib.UsedByUUID, adapter.Type, adapter.Name,
 					domainID)
 			}

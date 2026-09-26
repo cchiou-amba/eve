@@ -15,9 +15,11 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"text/template"
 	"time"
+	"unsafe"
 
 	zconfig "github.com/lf-edge/eve-api/go/config"
 	zcommon "github.com/lf-edge/eve-api/go/evecommon"
@@ -59,7 +61,9 @@ const (
 )
 
 var (
-	clientCid  = uint32(unix.VMADDR_CID_HOST + 1)
+	// Initialize clientCid with a high non-colliding base to avoid EADDRINUSE
+	// collisions with previously started domains upon pillar agent restart.
+	clientCid  = uint32(100 + (time.Now().UnixNano() % 10000))
 	vTPMClient = &http.Client{
 		Transport: vtpmClientUDSTransport(),
 		Timeout:   5 * time.Second,
@@ -561,6 +565,13 @@ const qemuIvshmemDoorbellTemplate = `
   vectors = "{{.Vectors}}"
 `
 
+// vfio-platform binds a physical platform peripheral directly into QEMU Stage-2 MMIO.
+const qemuVfioPlatformTemplate = `
+[device "vfio-uart{{.UartID}}"]
+  driver = "vfio-platform"
+  host = "{{.Host}}"
+`
+
 const qemuSwtpmTemplate = `
 [chardev "swtpm"]
   backend = "socket"
@@ -671,11 +682,18 @@ type tQemuIvshmemDoorbellContext struct {
 	Vectors    int
 }
 
+// Context for qemuVfioPlatformTemplate.
+type tQemuVfioPlatformContext struct {
+	UartID string
+	Host   string
+}
+
 var (
 	tQemuGlobalConf, tQemuSwtmp, tQemuVsock              *template.Template
 	tQemuPCIeBridge, tQemuPCIPassthru, tQemuPCIeRootPort *template.Template
 	tQemuDisk, tQemuNet, tQemuSerial, tQemuCANBus        *template.Template
 	tQemuIvshmem, tQemuIvshmemDoorbell                   *template.Template
+	tQemuVfioPlatform                                    *template.Template
 )
 
 // Initialize all Go templates used to generate qemu config file.
@@ -700,6 +718,10 @@ func init() {
 	tQemuIvshmemDoorbell, err = template.New("qemuIvshmemDoorbell").Parse(qemuIvshmemDoorbellTemplate)
 	if err != nil {
 		panic(fmt.Errorf("parsing qemuIvshmemDoorbellTemplate failed: %w", err))
+	}
+	tQemuVfioPlatform, err = template.New("qemuVfioPlatform").Parse(qemuVfioPlatformTemplate)
+	if err != nil {
+		panic(fmt.Errorf("parsing qemuVfioPlatformTemplate failed: %w", err))
 	}
 	tQemuPCIeBridge, err = template.New("qemuPCIeBridge").Parse(qemuPCIeBridgeTemplate)
 	if err != nil {
@@ -869,12 +891,14 @@ type ivshmemWindow struct {
 	size    uint64
 }
 
-// uartAdapter is one virtualized physical UART adapter to expose to a domain via ivshmem-doorbell.
+// uartAdapter is one virtualized physical UART adapter to expose to a domain.
 type uartAdapter struct {
-	id         string
-	uartID     string
-	socketPath string
-	devPath    string
+	id          string
+	uartID      string
+	socketPath  string
+	devPath     string
+	passthrough bool
+	hostDevice  string
 }
 
 // parseIvshmemSize accepts a plain byte count or a K/M/G suffixed size.
@@ -1000,11 +1024,27 @@ func uartAdapterFromBundle(ib types.IoBundle) (*uartAdapter, error) {
 		return nil, logError("uart adapter %s: unsupported uart ID %q", label, uartAttr)
 	}
 
+	passthrough := false
+	if ptAttr, ok := ib.Cbattr["passthrough"]; ok {
+		passthrough = strings.EqualFold(ptAttr, "true")
+	} else if _, err := os.Stat("/persist/enable_uart_passthrough"); err == nil {
+		passthrough = true
+	}
+
+	uartHostDevices := map[string]string{
+		"1": "ffe0017000.uart",
+		"2": "ffe0018000.uart",
+		"3": "ffe0019000.uart",
+		"4": "ffe001a000.uart",
+	}
+
 	return &uartAdapter{
-		id:         label,
-		uartID:     uartAttr,
-		socketPath: fmt.Sprintf("/run/amba_virt_uart%s.sock", uartAttr),
-		devPath:    fmt.Sprintf("/dev/amba_virt_uart%s", uartAttr),
+		id:          label,
+		uartID:      uartAttr,
+		socketPath:  fmt.Sprintf("/run/amba_virt_uart%s.sock", uartAttr),
+		devPath:     fmt.Sprintf("/dev/amba_virt_uart%s", uartAttr),
+		passthrough: passthrough,
+		hostDevice:  uartHostDevices[uartAttr],
 	}, nil
 }
 
@@ -1036,6 +1076,228 @@ func collectUartAdapters(domainName string, aa *types.AssignableAdapters,
 		}
 	}
 	return uarts, nil
+}
+
+const (
+	ambaDmaCtlDev        = "/dev/amba_dma_ctl"
+	ambaDmaIocLeaseAlloc = 0xc0304131
+	ambaDmaIocLeaseCtrl  = 0xc0184132
+
+	ambaDmaCmdDrain             = 1
+	ambaDmaCmdForceDrain        = 2
+	ambaDmaCmdRelease           = 3
+	ambaDmaCmdQuarantineRelease = 4
+)
+
+type ambaDmaLeaseAlloc struct {
+	VmUUID         [16]byte
+	BootGeneration uint32
+	VsockCID       uint32
+	LeaseID        uint32
+	Padding        uint32
+	Capability     uint64
+	Epoch          uint64
+}
+
+type ambaDmaLeaseControl struct {
+	LeaseID  uint32
+	Command  uint32
+	Epoch    uint64
+	Status   int32
+	Reserved uint32
+}
+
+type domainDmaLeaseInfo struct {
+	LeaseID uint32 `json:"lease_id"`
+	Epoch   uint64 `json:"epoch"`
+	Cid     uint32 `json:"cid"`
+}
+
+var (
+	domainLeaseLock sync.Mutex
+	domainLeases    = make(map[string]*domainDmaLeaseInfo)
+)
+
+func getDomainLeaseFile(domainName string) string {
+	return filepath.Join(kvmStateDir+domainName, "dma_lease.json")
+}
+
+func saveDomainLease(domainName string, info *domainDmaLeaseInfo) error {
+	domainLeaseLock.Lock()
+	domainLeases[domainName] = info
+	domainLeaseLock.Unlock()
+
+	dir := kvmStateDir + domainName
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(getDomainLeaseFile(domainName), data, 0644)
+}
+
+func loadDomainLease(domainName string) *domainDmaLeaseInfo {
+	domainLeaseLock.Lock()
+	if info, ok := domainLeases[domainName]; ok {
+		domainLeaseLock.Unlock()
+		return info
+	}
+	domainLeaseLock.Unlock()
+
+	data, err := os.ReadFile(getDomainLeaseFile(domainName))
+	if err != nil {
+		return nil
+	}
+	var info domainDmaLeaseInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return nil
+	}
+	domainLeaseLock.Lock()
+	domainLeases[domainName] = &info
+	domainLeaseLock.Unlock()
+	return &info
+}
+
+func allocateDmaLease(domainName string, domainUUID uuid.UUID, cid uint32) (uint32, error) {
+	// If /dev/amba_dma_ctl does not exist (e.g. running in mock test environment), allocate mock lease 0.
+	if _, err := os.Stat(ambaDmaCtlDev); os.IsNotExist(err) {
+		info := &domainDmaLeaseInfo{
+			LeaseID: 0,
+			Epoch:   1,
+			Cid:     cid,
+		}
+		_ = saveDomainLease(domainName, info)
+		return 0, nil
+	}
+
+	fd, err := os.OpenFile(ambaDmaCtlDev, os.O_RDWR, 0)
+	if err != nil {
+		return 0, fmt.Errorf("failed to open %s: %w", ambaDmaCtlDev, err)
+	}
+	defer fd.Close()
+
+	var alloc ambaDmaLeaseAlloc
+	copy(alloc.VmUUID[:], domainUUID[:])
+	alloc.BootGeneration = 1
+	alloc.VsockCID = cid
+
+	_, _, errno := unix.Syscall(
+		unix.SYS_IOCTL,
+		fd.Fd(),
+		uintptr(ambaDmaIocLeaseAlloc),
+		uintptr(unsafe.Pointer(&alloc)),
+	)
+	if errno != 0 {
+		return 0, fmt.Errorf("ioctl AMBA_DMA_IOC_LEASE_ALLOC failed: %w", errno)
+	}
+
+	info := &domainDmaLeaseInfo{
+		LeaseID: alloc.LeaseID,
+		Epoch:   alloc.Epoch,
+		Cid:     cid,
+	}
+	if err := saveDomainLease(domainName, info); err != nil {
+		var ctrl ambaDmaLeaseControl
+		ctrl.LeaseID = alloc.LeaseID
+		ctrl.Epoch = alloc.Epoch
+		ctrl.Command = ambaDmaCmdRelease
+		_, _, _ = unix.Syscall(unix.SYS_IOCTL, fd.Fd(), uintptr(ambaDmaIocLeaseCtrl), uintptr(unsafe.Pointer(&ctrl)))
+		return 0, fmt.Errorf("failed to save lease state for domain %s: %w", domainName, err)
+	}
+
+	return alloc.LeaseID, nil
+}
+
+func drainDmaLease(domainName string) {
+	info := loadDomainLease(domainName)
+	if info == nil {
+		return
+	}
+	if _, err := os.Stat(ambaDmaCtlDev); os.IsNotExist(err) {
+		return
+	}
+	fd, err := os.OpenFile(ambaDmaCtlDev, os.O_RDWR, 0)
+	if err != nil {
+		logrus.Warnf("drainDmaLease: open %s failed: %v", ambaDmaCtlDev, err)
+		return
+	}
+	defer fd.Close()
+
+	var ctrl ambaDmaLeaseControl
+	ctrl.LeaseID = info.LeaseID
+	ctrl.Epoch = info.Epoch
+	ctrl.Command = ambaDmaCmdDrain
+
+	_, _, errno := unix.Syscall(
+		unix.SYS_IOCTL,
+		fd.Fd(),
+		uintptr(ambaDmaIocLeaseCtrl),
+		uintptr(unsafe.Pointer(&ctrl)),
+	)
+	if errno != 0 {
+		logrus.Warnf("drainDmaLease: LEASE_DRAIN failed for lease %d: %v", info.LeaseID, errno)
+	} else {
+		logrus.Infof("drainDmaLease: drained lease %d for domain %s", info.LeaseID, domainName)
+	}
+}
+
+func releaseDmaLease(domainName string) {
+	info := loadDomainLease(domainName)
+	if info == nil {
+		return
+	}
+	domainLeaseLock.Lock()
+	delete(domainLeases, domainName)
+	domainLeaseLock.Unlock()
+	_ = os.Remove(getDomainLeaseFile(domainName))
+
+	if _, err := os.Stat(ambaDmaCtlDev); os.IsNotExist(err) {
+		return
+	}
+	fd, err := os.OpenFile(ambaDmaCtlDev, os.O_RDWR, 0)
+	if err != nil {
+		logrus.Warnf("releaseDmaLease: open %s failed: %v", ambaDmaCtlDev, err)
+		return
+	}
+	defer fd.Close()
+
+	var ctrl ambaDmaLeaseControl
+	ctrl.LeaseID = info.LeaseID
+	ctrl.Epoch = info.Epoch
+	ctrl.Command = ambaDmaCmdRelease
+
+	_, _, errno := unix.Syscall(
+		unix.SYS_IOCTL,
+		fd.Fd(),
+		uintptr(ambaDmaIocLeaseCtrl),
+		uintptr(unsafe.Pointer(&ctrl)),
+	)
+	if errno != 0 {
+		logrus.Warnf("releaseDmaLease: LEASE_RELEASE failed for lease %d: %v", info.LeaseID, errno)
+	} else {
+		logrus.Infof("releaseDmaLease: released lease %d for domain %s", info.LeaseID, domainName)
+	}
+}
+
+// uartPassthroughVMMOverhead charges 16 MiB for each passthrough UART adapter
+// because each adapter is backed by a 16 MiB low DMA32 slice.
+func uartPassthroughVMMOverhead(domainName string, aa *types.AssignableAdapters,
+	domainAdapterList []types.IoAdapter, domainUUID uuid.UUID) (int64, error) {
+	uarts, err := collectUartAdapters(domainName, aa, domainAdapterList, domainUUID)
+	if err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, u := range uarts {
+		if u.passthrough {
+			logrus.Infof("uartPassthroughVMMOverhead: counting 16 MiB DMA32 lease window for UART%s (domain %s)",
+				u.uartID, domainName)
+			total += int64(16 << 20)
+		}
+	}
+	return total, nil
 }
 
 // ensureSharedMemoryFile creates and sizes the ivshmem backing file.
@@ -1187,9 +1449,14 @@ func estimatedVMMOverhead(domainName string, aa *types.AssignableAdapters, domai
 		return 0, logError("ivshmemVMMOverhead() failed for domain %s: %v",
 			domainName, err)
 	}
+	uartOverhead, err := uartPassthroughVMMOverhead(domainName, aa, domainAdapterList, domainUUID)
+	if err != nil {
+		return 0, logError("uartPassthroughVMMOverhead() failed for domain %s: %v",
+			domainName, err)
+	}
 	overhead = undefinedVMMOverhead() + ramVMMOverhead(domainRAMSize) +
 		qemuVMMOverhead() + cpuVMMOverhead(domainMaxCpus, domainVcpus) + mmioOverhead +
-		ivshmemOverhead
+		ivshmemOverhead + uartOverhead
 
 	return overhead, nil
 }
@@ -2231,7 +2498,9 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 		list := aa.LookupIoBundleAny(adapter.Name)
 		// We reserved it in handleCreate so nobody could have stolen it
 		if len(list) == 0 {
-			logrus.Fatalf("IoBundle disappeared %d %s for %s\n",
+			logrus.Errorf("IoBundle disappeared %d %s for %s\n",
+				adapter.Type, adapter.Name, domainName)
+			return fmt.Errorf("IoBundle disappeared %d %s for %s",
 				adapter.Type, adapter.Name, domainName)
 		}
 		for _, ib := range list {
@@ -2239,9 +2508,11 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 				continue
 			}
 			if ib.UsedByUUID != config.UUIDandVersion.UUID {
-				logrus.Fatalf("IoBundle not ours %s: %d %s for %s\n",
+				logrus.Errorf("IoBundle not ours %s: %d %s for %s\n",
 					ib.UsedByUUID, adapter.Type, adapter.Name,
 					domainName)
+				return fmt.Errorf("IoBundle not ours %s: %d %s for %s",
+					ib.UsedByUUID, adapter.Type, adapter.Name, domainName)
 			}
 			if ib.PciLong != "" && ib.UsbAddr == "" {
 				logrus.Infof("Adding PCI device <%v>\n", ib.PciLong)
@@ -2379,40 +2650,73 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 		}
 	}
 
-	// Render UART ivshmem-doorbell adapters.
+	// Allocate guest CID first so it can be associated with DMA lease and vsock
+	allocatedCID := atomic.AddUint32(&clientCid, 1)
+
+	// Render UART adapters.
 	uartAdapters, err := collectUartAdapters(domainName, aa,
 		config.IoAdapterList, config.UUIDandVersion.UUID)
 	if err != nil {
 		return err
 	}
-	for _, u := range uartAdapters {
-		logrus.Infof("Adding UART ivshmem-doorbell <%s> (uart%s) on socket %s",
-			u.id, u.uartID, u.socketPath)
-		uartContext := tQemuIvshmemDoorbellContext{
-			ID:         u.id,
-			SocketPath: u.socketPath,
-			Vectors:    1,
+	var allocatedLease bool
+	defer func() {
+		if err != nil && allocatedLease {
+			releaseDmaLease(domainName)
 		}
-		if err := tQemuIvshmemDoorbell.Execute(file, uartContext); err != nil {
-			return logError("can't write UART ivshmem-doorbell assignment to config file %s (%v)",
-				file.Name(), err)
+	}()
+
+	for _, u := range uartAdapters {
+		if u.passthrough {
+			logrus.Infof("Adding UART vfio-platform <%s> (uart%s) host %s",
+				u.id, u.uartID, u.hostDevice)
+			vfioContext := tQemuVfioPlatformContext{
+				UartID: u.uartID,
+				Host:   u.hostDevice,
+			}
+			if err = tQemuVfioPlatform.Execute(file, vfioContext); err != nil {
+				return logError("can't write UART vfio-platform assignment to config file %s (%v)",
+					file.Name(), err)
+			}
+
+			leaseID, leaseErr := allocateDmaLease(domainName, config.UUIDandVersion.UUID, allocatedCID)
+			if leaseErr != nil {
+				return logError("failed to allocate DMA lease for domain %s: %v", domainName, leaseErr)
+			}
+			allocatedLease = true
+
+			logrus.Infof("Adding DMA32 lease window <%s> backed by /dev/amba_dma_lease%d (16 MiB)",
+				u.id, leaseID)
+			leaseContext := tQemuIvshmemContext{
+				ID:      fmt.Sprintf("dma32-lease%d", leaseID),
+				MemPath: fmt.Sprintf("/dev/amba_dma_lease%d", leaseID),
+				Size:    16 << 20,
+			}
+			if err = tQemuIvshmem.Execute(file, leaseContext); err != nil {
+				return logError("can't write DMA32 lease assignment to config file %s (%v)",
+					file.Name(), err)
+			}
+		} else {
+			logrus.Infof("Adding UART ivshmem-doorbell <%s> (uart%s) on socket %s",
+				u.id, u.uartID, u.socketPath)
+			uartContext := tQemuIvshmemDoorbellContext{
+				ID:         u.id,
+				SocketPath: u.socketPath,
+				Vectors:    1,
+			}
+			if err = tQemuIvshmemDoorbell.Execute(file, uartContext); err != nil {
+				return logError("can't write UART ivshmem-doorbell assignment to config file %s (%v)",
+					file.Name(), err)
+			}
 		}
 	}
 
 	// render vsock settings, this should go last to avoid
 	// PCI ID conflicts, let qemu assign PCI ID for vsock.
 	vsockContext := tQemuVsockContext{
-		// currently we don't save the clientCid/AppUUID pair since
-		// we there is no need for it, but in the future when wen
-		// we add channels for vms to report things like CPU/Mem usage
-		// then it makes sense to keep track of who is who.
-		GuestCID: fmt.Sprintf("%d",
-			// clientCid needs atomic add to avoid race condition
-			// in case CreateDomConfig is called concurrently, which
-			// happens at least in unit tests.
-			atomic.AddUint32(&clientCid, 1)),
+		GuestCID: fmt.Sprintf("%d", allocatedCID),
 	}
-	if err := tQemuVsock.Execute(file, vsockContext); err != nil {
+	if err = tQemuVsock.Execute(file, vsockContext); err != nil {
 		return logError("can't write to config file %s (%v)", file.Name(), err)
 	}
 
@@ -2483,8 +2787,13 @@ func (ctx KvmContext) Start(domainName string) error {
 
 // Stop stops a domain
 func (ctx KvmContext) Stop(domainName string, _ bool) error {
-	if err := execShutdown(GetQmpExecutorSocket(domainName)); err != nil {
-		return logError("Stop: failed to execute shutdown command %v", err)
+	qmpSock := GetQmpExecutorSocket(domainName)
+	if _, err := os.Stat(qmpSock); err == nil {
+		execStop(qmpSock)
+		drainDmaLease(domainName)
+		if err := execShutdown(qmpSock); err != nil {
+			logrus.Warnf("Stop: failed to execute shutdown command %v (qemu may already be stopped)", err)
+		}
 	}
 	return nil
 }
@@ -2492,13 +2801,15 @@ func (ctx KvmContext) Stop(domainName string, _ bool) error {
 // Delete deletes a domain
 func (ctx KvmContext) Delete(domainName string) (result error) {
 	//Sending a stop signal to then domain before quitting. This is done to freeze the domain before quitting it.
-	_, err := os.Stat(GetQmpExecutorSocket(domainName))
-	if err == nil {
-		execStop(GetQmpExecutorSocket(domainName))
-		if err = execQuit(GetQmpExecutorSocket(domainName)); err != nil {
-			return logError("failed to execute quit command %v", err)
+	qmpSock := GetQmpExecutorSocket(domainName)
+	if _, err := os.Stat(qmpSock); err == nil {
+		execStop(qmpSock)
+		drainDmaLease(domainName)
+		if err = execQuit(qmpSock); err != nil {
+			logrus.Warnf("failed to execute quit command %v (qemu may already be dead)", err)
 		}
 	}
+	releaseDmaLease(domainName)
 	// we may want to wait a little bit here and actually kill qemu process if it gets wedged
 	if err := os.RemoveAll(kvmStateDir + domainName); err != nil {
 		return logError("failed to clean up domain state directory %s (%v)", domainName, err)
@@ -2526,6 +2837,7 @@ func (ctx KvmContext) Info(domainName string) (int, types.SwState, error) {
 
 // Cleanup cleans up a domain
 func (ctx KvmContext) Cleanup(domainName string) error {
+	releaseDmaLease(domainName)
 	if err := ctx.ctrdContext.Cleanup(domainName); err != nil {
 		return fmt.Errorf("couldn't cleanup task %s: %v", domainName, err)
 	}

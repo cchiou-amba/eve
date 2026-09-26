@@ -474,3 +474,144 @@ func TestCreateDomConfigWithUart(t *testing.T) {
 		}
 	}
 }
+
+func TestUartAdapterFromBundle_Passthrough(t *testing.T) {
+	t.Parallel()
+
+	u, err := uartAdapterFromBundle(types.IoBundle{
+		Type:         types.IoOther,
+		Phylabel:     "UART2",
+		Logicallabel: "UART2",
+		Cbattr: map[string]string{
+			"uart":        "2",
+			"passthrough": "true",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if u == nil {
+		t.Fatal("expected a uartAdapter for UART2 passthrough bundle")
+	}
+	if !u.passthrough {
+		t.Errorf("expected passthrough=true, got %+v", *u)
+	}
+	if u.hostDevice != "ffe0018000.uart" {
+		t.Errorf("expected hostDevice=ffe0018000.uart, got %q", u.hostDevice)
+	}
+}
+
+func TestCreateDomConfigWithUartPassthrough(t *testing.T) {
+	t.Parallel()
+
+	conf, err := os.CreateTemp("/tmp", "config")
+	if err != nil {
+		t.Fatalf("can't create config file for a domain %v", err)
+	}
+	defer os.Remove(conf.Name())
+
+	diskConfigs, diskStatuses := qemuDisks()
+	config, aa := domainConfigAndAssignableAdapters(diskConfigs)
+	config.VirtualizationMode = types.HVM
+
+	config.IoAdapterList = append(config.IoAdapterList, types.IoAdapter{
+		Type: types.IoOther,
+		Name: "UART2",
+	})
+	aa.IoBundleList = append(aa.IoBundleList, types.IoBundle{
+		Type:            types.IoOther,
+		AssignmentGroup: "uart2",
+		Phylabel:        "UART2",
+		Logicallabel:    "UART2",
+		Cbattr: map[string]string{
+			"uart":        "2",
+			"passthrough": "true",
+		},
+		UsedByUUID: config.UUIDandVersion.UUID,
+	})
+
+	if err := kvmArm.CreateDomConfig(DefaultDomainName, config, types.DomainStatus{},
+		diskStatuses, &aa, nil, swtpmCtrlSock, conf); err != nil {
+		t.Fatalf("CreateDomConfig failed %v", err)
+	}
+	defer os.Truncate(conf.Name(), 0)
+
+	result, err := os.ReadFile(conf.Name())
+	if err != nil {
+		t.Fatalf("reading conf file failed %v", err)
+	}
+	got := string(result)
+
+	// Must contain direct vfio-platform UART device
+	for _, want := range []string{
+		`[device "vfio-uart2"]`,
+		`driver = "vfio-platform"`,
+		`host = "ffe0018000.uart"`,
+		`[object "dma32-lease0"]`,
+		`qom-type = "memory-backend-file"`,
+		`mem-path = "/dev/amba_dma_lease0"`,
+		`size = "16777216"`,
+		`share = "on"`,
+		`[device "dma32-lease0-dev"]`,
+		`driver = "ivshmem-plain"`,
+		`memdev = "dma32-lease0"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("generated passthrough config is missing %q:\n%s", want, got)
+		}
+	}
+
+	// Must NOT contain legacy proxy ivshmem-doorbell or socket
+	for _, unwanted := range []string{
+		`ivshmem-doorbell`,
+		`/run/amba_virt_uart2.sock`,
+	} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("generated passthrough config contains legacy proxy directive %q:\n%s", unwanted, got)
+		}
+	}
+}
+
+func TestUartPassthroughVMMOverhead(t *testing.T) {
+	t.Parallel()
+
+	id, err := uuid.NewV4()
+	if err != nil {
+		t.Fatalf("NewV4 failed: %v", err)
+	}
+	adapters := []types.IoAdapter{{Type: types.IoOther, Name: "UART2"}}
+	aa := types.AssignableAdapters{
+		Initialized: true,
+		IoBundleList: []types.IoBundle{
+			{
+				Type:            types.IoOther,
+				AssignmentGroup: "uart2",
+				Phylabel:        "UART2",
+				Logicallabel:    "UART2",
+				Cbattr: map[string]string{
+					"uart":        "2",
+					"passthrough": "true",
+				},
+				UsedByUUID: id,
+			},
+		},
+	}
+
+	got, err := uartPassthroughVMMOverhead(DefaultDomainName, &aa, adapters, id)
+	if err != nil {
+		t.Fatalf("uartPassthroughVMMOverhead failed: %v", err)
+	}
+	if want := int64(16 << 20); got != want {
+		t.Errorf("uartPassthroughVMMOverhead = %d, want %d (16 MiB lease slice)", got, want)
+	}
+
+	// Non-passthrough UART adapter has 0 additional DMA overhead
+	aa.IoBundleList[0].Cbattr["passthrough"] = "false"
+	got, err = uartPassthroughVMMOverhead(DefaultDomainName, &aa, adapters, id)
+	if err != nil {
+		t.Fatalf("uartPassthroughVMMOverhead failed: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("uartPassthroughVMMOverhead for non-passthrough = %d, want 0", got)
+	}
+}

@@ -6,9 +6,11 @@ package linuxitems
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
+	"strings"
 
 	dg "github.com/lf-edge/eve-libs/depgraph"
 	"github.com/lf-edge/eve/pkg/pillar/base"
@@ -133,9 +135,11 @@ func (c *BridgeConfigurator) Create(ctx context.Context, item dg.Item) error {
 	}
 	netlinkBridge := &netlink.Bridge{LinkAttrs: attrs}
 	if err := netlink.LinkAdd(netlinkBridge); err != nil {
-		err = fmt.Errorf("failed to add bridge %s: %w", bridge.IfName, err)
-		c.Log.Error(err)
-		return err
+		if !errors.Is(err, os.ErrExist) && !strings.Contains(err.Error(), "file exists") {
+			err = fmt.Errorf("failed to add bridge %s: %w", bridge.IfName, err)
+			c.Log.Error(err)
+			return err
+		}
 	}
 	if err := netlink.LinkSetUp(netlinkBridge); err != nil {
 		err = fmt.Errorf("failed to set bridge %s UP: %w", bridge.IfName, err)
@@ -169,8 +173,10 @@ func (c *BridgeConfigurator) Create(ctx context.Context, item dg.Item) error {
 	for _, ipAddr := range bridge.IPAddresses {
 		addr := &netlink.Addr{IPNet: ipAddr}
 		if err := netlink.AddrAdd(link, addr); err != nil {
-			return fmt.Errorf("failed to add IP address %v to bridge %s: %w",
-				ipAddr, bridge.IfName, err)
+			if !errors.Is(err, os.ErrExist) && !strings.Contains(err.Error(), "file exists") {
+				return fmt.Errorf("failed to add IP address %v to bridge %s: %w",
+					ipAddr, bridge.IfName, err)
+			}
 		}
 	}
 	return nil

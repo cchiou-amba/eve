@@ -102,19 +102,26 @@ func (c *IPSetConfigurator) Create(ctx context.Context, item dg.Item) error {
 	args := []string{"create", ipset.SetName, ipset.TypeName, "family", family}
 	if output, err := base.Exec(c.Log, ipsetCmd, args...).CombinedOutput(); err != nil {
 		outputStr := strings.TrimSpace(string(output))
-		err = fmt.Errorf("failed to create ipset %+v: %s (err: %w)",
-			ipset, outputStr, err)
-		c.Log.Error(err)
-		return err
+		if !strings.Contains(outputStr, "already exists") {
+			err = fmt.Errorf("failed to create ipset %+v: %s (err: %w)",
+				ipset, outputStr, err)
+			c.Log.Error(err)
+			return err
+		}
+		// Flush existing entries if set already exists
+		flushArgs := []string{"flush", ipset.SetName}
+		base.Exec(c.Log, ipsetCmd, flushArgs...).CombinedOutput()
 	}
 	for _, entry := range ipset.Entries {
 		args = []string{"add", ipset.SetName, entry}
 		if output, err := base.Exec(c.Log, ipsetCmd, args...).CombinedOutput(); err != nil {
 			outputStr := strings.TrimSpace(string(output))
-			err = fmt.Errorf("failed to add entry %s into ipset %s: %s (err: %w)",
-				entry, ipset.SetName, outputStr, err)
-			c.Log.Error(err)
-			return err
+			if !strings.Contains(outputStr, "already added") && !strings.Contains(outputStr, "already exists") {
+				err = fmt.Errorf("failed to add entry %s into ipset %s: %s (err: %w)",
+					entry, ipset.SetName, outputStr, err)
+				c.Log.Error(err)
+				return err
+			}
 		}
 	}
 	return nil

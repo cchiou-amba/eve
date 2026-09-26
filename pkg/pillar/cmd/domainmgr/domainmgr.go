@@ -1275,74 +1275,7 @@ func maybeRetryBoot(ctx *domainContext, status *types.DomainStatus) {
 		status.ClearError()
 	}
 
-	filename := xenCfgFilename(config.AppNum)
-	file, err := os.Create(filename)
-	if err != nil {
-		//it is retry, so omit error
-		log.Error("os.Create for ", filename, err)
-	}
-	defer file.Close()
-
-	// setup Windows OEM license key if enabled
-	if config.EnableOemWinLicenseKey {
-		getDmiSystemInfo(&config.OemWindowsLicenseKeyInfo.SystemInfo)
-		err = hyper.Task(status).OemWindowsLicenseKeySetup(&config.OemWindowsLicenseKeyInfo)
-		if err != nil {
-			// let the VM to boot and just log the error? or terminate?
-			log.Errorf("Failed to setup Windows OEM license key for %s: %s", status.DomainName, err)
-			status.PassthroughWindowsLicenseKey = false
-		} else {
-			status.PassthroughWindowsLicenseKey = true
-		}
-	}
-
-	if config.DisableVirtualTPM {
-		log.Warnf("vTPM is disabled for %s by user request", status.DomainName)
-		status.VirtualTPM = false
-	} else {
-		wp := &types.WatchdogParam{Ps: ctx.ps, AgentName: agentName, WarnTime: warningTime, ErrTime: errorTime}
-		err = hyper.Task(status).VirtualTPMSetup(status.DomainName, wp)
-		if err == nil {
-			status.VirtualTPM = true
-			defer func(status *types.DomainStatus, wp *types.WatchdogParam) {
-				// this means we failed to boot the VM.
-				if !status.Activated {
-					log.Noticef("Failed to activate domain: %s, terminating vTPM", status.DomainName)
-					if err := hyper.Task(status).VirtualTPMTerminate(status.DomainName, wp); err != nil {
-						// this is not a critical failure so just log it
-						log.Errorf("Failed to terminate vTPM for %s: %s", status.DomainName, err)
-					}
-				}
-			}(status, wp)
-		} else {
-			status.VirtualTPM = false
-			log.Errorf("Failed to setup vTPM for %s: %s", status.DomainName, err)
-		}
-	}
-
-	globalConfig := agentlog.GetGlobalConfig(log, ctx.subGlobalConfig)
-	if err := hyper.Task(status).Setup(*status, *config, ctx.assignableAdapters, globalConfig, file); err != nil {
-		//it is retry, so omit error
-		log.Errorf("Failed to create DomainStatus from %+v: %s",
-			config, err)
-	}
-
-	status.TriedCount++
-
-	ctx.createSema.V(1)
-	domainID, err := DomainCreate(ctx, *status)
-	ctx.createSema.P(1)
-	if err != nil {
-		log.Errorf("maybeRetryBoot DomainCreate for %s: %s",
-			status.DomainName, err)
-		status.BootFailed = true
-		status.SetErrorNow(err.Error())
-		publishDomainStatus(ctx, status)
-		return
-	}
-	status.BootFailed = false
-	doActivateTail(ctx, status, domainID)
-	publishDomainStatus(ctx, status)
+	doActivate(ctx, *config, status)
 	log.Functionf("maybeRetryBoot(%s) DONE for %s",
 		status.Key(), status.DisplayName)
 }
@@ -1414,8 +1347,14 @@ func lookupDomainStatusByUUID(ctx *domainContext, uuid uuid.UUID) *types.DomainS
 }
 
 func lookupDomainConfig(ctx *domainContext, key string) *types.DomainConfig {
-
+	if ctx == nil {
+		return nil
+	}
 	sub := ctx.subDomainConfig
+	if sub == nil {
+		log.Functionf("lookupDomainConfig(%s) subDomainConfig is nil", key)
+		return nil
+	}
 	c, _ := sub.Get(key)
 	if c == nil {
 		log.Functionf("lookupDomainConfig(%s) not found", key)

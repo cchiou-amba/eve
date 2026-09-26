@@ -324,7 +324,7 @@ func (c *ChainConfigurator) Create(ctx context.Context, item depgraph.Item) erro
 	args := []string{"-N", chain.ChainName, "-t", chain.Table}
 	fn := iptablesFn[chain.command()]
 	err := fn(c.Log, args...)
-	if err != nil {
+	if err != nil && !strings.Contains(err.Error(), "Chain already exists") {
 		return err
 	}
 	// Make sure we start with empty content.

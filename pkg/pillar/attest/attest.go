@@ -471,9 +471,8 @@ func despatchEvent(event Event, state types.AttestState, ctx *Context) error {
 			event.String(), state.String())
 		return elem(ctx)
 	} else {
-		ctx.log.Fatalf("Unexpected Event %s in State %s",
+		ctx.log.Warnf("Unexpected Event %s in State %s",
 			event.String(), state.String())
-		//just to keep compiler happy
 		return fmt.Errorf("Unexpected Event %s in State %s",
 			event.String(), state.String())
 	}
