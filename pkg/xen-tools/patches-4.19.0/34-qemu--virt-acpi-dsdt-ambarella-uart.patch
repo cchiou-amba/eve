@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000000..f7f6f1c4e1
 --- /dev/null
 +++ b/tools/qemu-xen/include/hw/vfio/vfio-platform-sysbus.h
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,26 @@
 +/*
 + * vfio-platform-sysbus.h
 + *
