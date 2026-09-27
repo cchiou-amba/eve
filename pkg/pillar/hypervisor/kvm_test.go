@@ -1319,6 +1319,8 @@ func domConfigArm64() string {
   password = "on"
 [device "video0"]
   driver = "virtio-gpu-pci"
+  bus = "pcie.0"
+  addr = "0x1"
 [device "pci.2"]
   driver = "pcie-root-port"
   port = "12"

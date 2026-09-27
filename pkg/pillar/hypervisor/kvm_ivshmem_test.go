@@ -312,8 +312,8 @@ func TestUartAdapterFromBundle(t *testing.T) {
 	if u == nil {
 		t.Fatal("expected a uartAdapter for UART2 bundle")
 	}
-	if u.id != "UART2" || u.uartID != "2" || u.socketPath != "/run/amba_virt_uart2.sock" || u.devPath != "/dev/amba_virt_uart2" {
-		t.Errorf("got %+v, want id=UART2 uartID=2 socketPath=/run/amba_virt_uart2.sock devPath=/dev/amba_virt_uart2", *u)
+	if u.id != "UART2" || u.uartID != "2" || u.hostDevice != "ffe0018000.uart" {
+		t.Errorf("got %+v, want id=UART2 uartID=2 hostDevice=ffe0018000.uart", *u)
 	}
 
 	// Valid UART3 bundle (QNX HVM target).
@@ -328,8 +328,8 @@ func TestUartAdapterFromBundle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if u == nil || u.uartID != "3" || u.socketPath != "/run/amba_virt_uart3.sock" {
-		t.Errorf("got %+v, want uartID=3", *u)
+	if u == nil || u.uartID != "3" || u.hostDevice != "ffe0019000.uart" {
+		t.Errorf("got %+v, want uartID=3 hostDevice=ffe0019000.uart", *u)
 	}
 
 	// UART0 is host management console (filtered from guest HVM).
@@ -460,89 +460,7 @@ func TestCreateDomConfigWithUart(t *testing.T) {
 	}
 	got := string(result)
 
-	for _, want := range []string{
-		`[chardev "ivs-chardev-UART2"]`,
-		`backend = "socket"`,
-		`path = "/run/amba_virt_uart2.sock"`,
-		`[device "UART2-dev"]`,
-		`driver = "ivshmem-doorbell"`,
-		`chardev = "ivs-chardev-UART2"`,
-		`vectors = "1"`,
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("generated config is missing %q:\n%s", want, got)
-		}
-	}
-}
-
-func TestUartAdapterFromBundle_Passthrough(t *testing.T) {
-	t.Parallel()
-
-	u, err := uartAdapterFromBundle(types.IoBundle{
-		Type:         types.IoOther,
-		Phylabel:     "UART2",
-		Logicallabel: "UART2",
-		Cbattr: map[string]string{
-			"uart":        "2",
-			"passthrough": "true",
-		},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if u == nil {
-		t.Fatal("expected a uartAdapter for UART2 passthrough bundle")
-	}
-	if !u.passthrough {
-		t.Errorf("expected passthrough=true, got %+v", *u)
-	}
-	if u.hostDevice != "ffe0018000.uart" {
-		t.Errorf("expected hostDevice=ffe0018000.uart, got %q", u.hostDevice)
-	}
-}
-
-func TestCreateDomConfigWithUartPassthrough(t *testing.T) {
-	t.Parallel()
-
-	conf, err := os.CreateTemp("/tmp", "config")
-	if err != nil {
-		t.Fatalf("can't create config file for a domain %v", err)
-	}
-	defer os.Remove(conf.Name())
-
-	diskConfigs, diskStatuses := qemuDisks()
-	config, aa := domainConfigAndAssignableAdapters(diskConfigs)
-	config.VirtualizationMode = types.HVM
-
-	config.IoAdapterList = append(config.IoAdapterList, types.IoAdapter{
-		Type: types.IoOther,
-		Name: "UART2",
-	})
-	aa.IoBundleList = append(aa.IoBundleList, types.IoBundle{
-		Type:            types.IoOther,
-		AssignmentGroup: "uart2",
-		Phylabel:        "UART2",
-		Logicallabel:    "UART2",
-		Cbattr: map[string]string{
-			"uart":        "2",
-			"passthrough": "true",
-		},
-		UsedByUUID: config.UUIDandVersion.UUID,
-	})
-
-	if err := kvmArm.CreateDomConfig(DefaultDomainName, config, types.DomainStatus{},
-		diskStatuses, &aa, nil, swtpmCtrlSock, conf); err != nil {
-		t.Fatalf("CreateDomConfig failed %v", err)
-	}
-	defer os.Truncate(conf.Name(), 0)
-
-	result, err := os.ReadFile(conf.Name())
-	if err != nil {
-		t.Fatalf("reading conf file failed %v", err)
-	}
-	got := string(result)
-
-	// Must contain direct vfio-platform UART device
+	// Must contain direct vfio-platform UART device and DMA32 lease window
 	for _, want := range []string{
 		`[device "vfio-uart2"]`,
 		`driver = "vfio-platform"`,
@@ -557,7 +475,7 @@ func TestCreateDomConfigWithUartPassthrough(t *testing.T) {
 		`memdev = "dma32-lease0"`,
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("generated passthrough config is missing %q:\n%s", want, got)
+			t.Errorf("generated config is missing %q:\n%s", want, got)
 		}
 	}
 
@@ -567,7 +485,7 @@ func TestCreateDomConfigWithUartPassthrough(t *testing.T) {
 		`/run/amba_virt_uart2.sock`,
 	} {
 		if strings.Contains(got, unwanted) {
-			t.Errorf("generated passthrough config contains legacy proxy directive %q:\n%s", unwanted, got)
+			t.Errorf("generated config contains legacy proxy directive %q:\n%s", unwanted, got)
 		}
 	}
 }
@@ -589,8 +507,7 @@ func TestUartPassthroughVMMOverhead(t *testing.T) {
 				Phylabel:        "UART2",
 				Logicallabel:    "UART2",
 				Cbattr: map[string]string{
-					"uart":        "2",
-					"passthrough": "true",
+					"uart": "2",
 				},
 				UsedByUUID: id,
 			},
@@ -605,13 +522,305 @@ func TestUartPassthroughVMMOverhead(t *testing.T) {
 		t.Errorf("uartPassthroughVMMOverhead = %d, want %d (16 MiB lease slice)", got, want)
 	}
 
-	// Non-passthrough UART adapter has 0 additional DMA overhead
-	aa.IoBundleList[0].Cbattr["passthrough"] = "false"
-	got, err = uartPassthroughVMMOverhead(DefaultDomainName, &aa, adapters, id)
+	// Domain with no UART adapters has 0 UART overhead
+	aaNoUart := types.AssignableAdapters{Initialized: true}
+	got, err = uartPassthroughVMMOverhead(DefaultDomainName, &aaNoUart, nil, id)
 	if err != nil {
 		t.Fatalf("uartPassthroughVMMOverhead failed: %v", err)
 	}
 	if got != 0 {
-		t.Errorf("uartPassthroughVMMOverhead for non-passthrough = %d, want 0", got)
+		t.Errorf("uartPassthroughVMMOverhead for empty adapters = %d, want 0", got)
+	}
+}
+
+func TestUartLeaseReused(t *testing.T) {
+	testDomain := DefaultDomainName
+	defer releaseDmaLease(testDomain)
+
+	diskConfigs, diskStatuses := qemuDisks()
+	config, aa := domainConfigAndAssignableAdapters(diskConfigs)
+	config.VirtualizationMode = types.HVM
+	config.IoAdapterList = append(config.IoAdapterList, types.IoAdapter{
+		Type: types.IoOther,
+		Name: "UART2",
+	})
+	aa.IoBundleList = append(aa.IoBundleList, types.IoBundle{
+		Type:            types.IoOther,
+		AssignmentGroup: "uart2",
+		Phylabel:        "UART2",
+		Logicallabel:    "UART2",
+		Cbattr:          map[string]string{"uart": "2"},
+		UsedByUUID:      config.UUIDandVersion.UUID,
+	})
+
+	conf1, err := os.CreateTemp("/tmp", "config1")
+	if err != nil {
+		t.Fatalf("can't create config1 file: %v", err)
+	}
+	defer os.Remove(conf1.Name())
+
+	if err := kvmArm.CreateDomConfig(testDomain, config, types.DomainStatus{},
+		diskStatuses, &aa, nil, swtpmCtrlSock, conf1); err != nil {
+		t.Fatalf("first CreateDomConfig failed: %v", err)
+	}
+
+	result1, err := os.ReadFile(conf1.Name())
+	if err != nil {
+		t.Fatalf("reading conf1 file failed: %v", err)
+	}
+	got1 := string(result1)
+
+	// Extract CID from first config
+	cid1 := ""
+	for _, line := range strings.Split(got1, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "guest-cid =") {
+			cid1 = strings.TrimSpace(line)
+			break
+		}
+	}
+	if cid1 == "" {
+		t.Fatalf("first config missing guest-cid:\n%s", got1)
+	}
+	if !strings.Contains(got1, `/dev/amba_dma_lease0`) {
+		t.Fatalf("first config missing /dev/amba_dma_lease0:\n%s", got1)
+	}
+
+	// Second CreateDomConfig for the SAME domain name
+	conf2, err := os.CreateTemp("/tmp", "config2")
+	if err != nil {
+		t.Fatalf("can't create config2 file: %v", err)
+	}
+	defer os.Remove(conf2.Name())
+
+	if err := kvmArm.CreateDomConfig(testDomain, config, types.DomainStatus{},
+		diskStatuses, &aa, nil, swtpmCtrlSock, conf2); err != nil {
+		t.Fatalf("second CreateDomConfig failed: %v", err)
+	}
+
+	result2, err := os.ReadFile(conf2.Name())
+	if err != nil {
+		t.Fatalf("reading conf2 file failed: %v", err)
+	}
+	got2 := string(result2)
+
+	cid2 := ""
+	for _, line := range strings.Split(got2, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "guest-cid =") {
+			cid2 = strings.TrimSpace(line)
+			break
+		}
+	}
+	if cid2 == "" {
+		t.Fatalf("second config missing guest-cid:\n%s", got2)
+	}
+	if cid1 != cid2 {
+		t.Errorf("second config CID changed: got %s, want %s", cid2, cid1)
+	}
+	if !strings.Contains(got2, `/dev/amba_dma_lease0`) {
+		t.Fatalf("second config missing /dev/amba_dma_lease0:\n%s", got2)
+	}
+
+	// A different domain name gets its own distinct CID and lease
+	otherDomain := "11111111-2222-3333-4444-555555555555.0.0"
+	defer releaseDmaLease(otherDomain)
+
+	conf3, err := os.CreateTemp("/tmp", "config3")
+	if err != nil {
+		t.Fatalf("can't create config3 file: %v", err)
+	}
+	defer os.Remove(conf3.Name())
+
+	otherConfig, otherAa := domainConfigAndAssignableAdapters(diskConfigs)
+	otherID, err := uuid.FromString("11111111-2222-3333-4444-555555555555")
+	if err != nil {
+		t.Fatalf("failed to parse UUID: %v", err)
+	}
+	otherConfig.UUIDandVersion.UUID = otherID
+	otherConfig.VirtualizationMode = types.HVM
+	for i := range otherAa.IoBundleList {
+		otherAa.IoBundleList[i].UsedByUUID = otherID
+	}
+	otherConfig.IoAdapterList = append(otherConfig.IoAdapterList, types.IoAdapter{
+		Type: types.IoOther,
+		Name: "UART2",
+	})
+	otherAa.IoBundleList = append(otherAa.IoBundleList, types.IoBundle{
+		Type:            types.IoOther,
+		AssignmentGroup: "uart2",
+		Phylabel:        "UART2",
+		Logicallabel:    "UART2",
+		Cbattr:          map[string]string{"uart": "2"},
+		UsedByUUID:      otherID,
+	})
+
+	if err := kvmArm.CreateDomConfig(otherDomain, otherConfig, types.DomainStatus{},
+		diskStatuses, &otherAa, nil, swtpmCtrlSock, conf3); err != nil {
+		t.Fatalf("third CreateDomConfig for other domain failed: %v", err)
+	}
+
+	result3, err := os.ReadFile(conf3.Name())
+	if err != nil {
+		t.Fatalf("reading conf3 file failed: %v", err)
+	}
+	got3 := string(result3)
+
+	cid3 := ""
+	for _, line := range strings.Split(got3, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "guest-cid =") {
+			cid3 = strings.TrimSpace(line)
+			break
+		}
+	}
+	if cid3 == cid1 {
+		t.Errorf("other domain unexpectedly reused cid %s", cid3)
+	}
+}
+
+func TestDomConfigFailurePreservesFile(t *testing.T) {
+	testDomain := DefaultDomainName
+	defer releaseDmaLease(testDomain)
+
+	conf, err := os.CreateTemp("/tmp", "config-atomic")
+	if err != nil {
+		t.Fatalf("can't create temp config file: %v", err)
+	}
+	defer os.Remove(conf.Name())
+
+	diskConfigs, diskStatuses := qemuDisks()
+	config, aa := domainConfigAndAssignableAdapters(diskConfigs)
+	config.VirtualizationMode = types.HVM
+	config.IoAdapterList = append(config.IoAdapterList, types.IoAdapter{
+		Type: types.IoOther,
+		Name: "UART2",
+	})
+	aa.IoBundleList = append(aa.IoBundleList, types.IoBundle{
+		Type:            types.IoOther,
+		AssignmentGroup: "uart2",
+		Phylabel:        "UART2",
+		Logicallabel:    "UART2",
+		Cbattr:          map[string]string{"uart": "2"},
+		UsedByUUID:      config.UUIDandVersion.UUID,
+	})
+
+	// Initial successful generation
+	if err := kvmArm.CreateDomConfig(testDomain, config, types.DomainStatus{},
+		diskStatuses, &aa, nil, swtpmCtrlSock, conf); err != nil {
+		t.Fatalf("initial CreateDomConfig failed: %v", err)
+	}
+
+	origBytes, err := os.ReadFile(conf.Name())
+	if err != nil {
+		t.Fatalf("failed to read original config: %v", err)
+	}
+	if len(origBytes) == 0 {
+		t.Fatal("original config is empty")
+	}
+
+	// Injected failure: pass invalid adapter configuration that triggers failure during generation
+	badAa := aa
+	badAa.IoBundleList = append(badAa.IoBundleList, types.IoBundle{
+		Type:            types.IoOther,
+		AssignmentGroup: "bad",
+		Phylabel:        "bad",
+		Logicallabel:    "bad",
+		Cbattr:          map[string]string{"uart": "invalid-id"},
+		UsedByUUID:      config.UUIDandVersion.UUID,
+	})
+	badConfig := config
+	badConfig.IoAdapterList = append(badConfig.IoAdapterList, types.IoAdapter{
+		Type: types.IoOther,
+		Name: "bad",
+	})
+
+	err = kvmArm.CreateDomConfig(testDomain, badConfig, types.DomainStatus{},
+		diskStatuses, &badAa, nil, swtpmCtrlSock, conf)
+	if err == nil {
+		t.Fatal("expected CreateDomConfig to fail for invalid adapter bundle")
+	}
+
+	// Verify that the file content on disk is completely preserved and unchanged
+	newBytes, err := os.ReadFile(conf.Name())
+	if err != nil {
+		t.Fatalf("failed to read config after failure: %v", err)
+	}
+	if string(newBytes) != string(origBytes) {
+		t.Fatalf("config file was corrupted or modified on failure:\nGot:\n%s\nWant:\n%s",
+			string(newBytes), string(origBytes))
+	}
+}
+
+func TestDomConfigRejectsRegularFileAtLeasePath(t *testing.T) {
+	testDomain := DefaultDomainName
+	defer releaseDmaLease(testDomain)
+
+	// Create a dummy control device file so kvm.go knows to enforce char device check
+	dummyCtl, err := os.CreateTemp("/tmp", "mock_amba_dma_ctl")
+	if err != nil {
+		t.Fatalf("failed to create dummy ctl file: %v", err)
+	}
+	defer os.Remove(dummyCtl.Name())
+
+	// Create a dummy regular file at the mock lease path
+	dummyLease, err := os.CreateTemp("/tmp", "mock_amba_dma_lease")
+	if err != nil {
+		t.Fatalf("failed to create dummy lease file: %v", err)
+	}
+	defer os.Remove(dummyLease.Name())
+
+	// Override paths for testing
+	origCtl := ambaDmaCtlDev
+	origLeaseFunc := ambaDmaLeasePathFunc
+	ambaDmaCtlDev = dummyCtl.Name()
+	ambaDmaLeasePathFunc = func(leaseID uint32) string {
+		return dummyLease.Name()
+	}
+	defer func() {
+		ambaDmaCtlDev = origCtl
+		ambaDmaLeasePathFunc = origLeaseFunc
+	}()
+
+	conf, err := os.CreateTemp("/tmp", "config-reject")
+	if err != nil {
+		t.Fatalf("can't create temp config file: %v", err)
+	}
+	defer os.Remove(conf.Name())
+
+	_ = saveDomainLease(testDomain, &domainDmaLeaseInfo{
+		LeaseID: 0,
+		Epoch:   1,
+		Cid:     10,
+	})
+
+	diskConfigs, diskStatuses := qemuDisks()
+	config, aa := domainConfigAndAssignableAdapters(diskConfigs)
+	config.VirtualizationMode = types.HVM
+	config.IoAdapterList = append(config.IoAdapterList, types.IoAdapter{
+		Type: types.IoOther,
+		Name: "UART2",
+	})
+	aa.IoBundleList = append(aa.IoBundleList, types.IoBundle{
+		Type:            types.IoOther,
+		AssignmentGroup: "uart2",
+		Phylabel:        "UART2",
+		Logicallabel:    "UART2",
+		Cbattr:          map[string]string{"uart": "2"},
+		UsedByUUID:      config.UUIDandVersion.UUID,
+	})
+
+	err = kvmArm.CreateDomConfig(testDomain, config, types.DomainStatus{},
+		diskStatuses, &aa, nil, swtpmCtrlSock, conf)
+	if err == nil {
+		t.Fatal("expected CreateDomConfig to fail when lease path is a regular file, but it succeeded")
+	}
+
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, dummyLease.Name()) || !strings.Contains(errMsg, "regular file") {
+		t.Fatalf("expected error message to name the path and 'regular file', got: %s", errMsg)
+	}
+
+	// Verify that the stanza was NOT written to the config file
+	confBytes, _ := os.ReadFile(conf.Name())
+	if strings.Contains(string(confBytes), "dma32-lease") {
+		t.Fatalf("dma32-lease stanza was unexpectedly written to config file on error: %s", string(confBytes))
 	}
 }
