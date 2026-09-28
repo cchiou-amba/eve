@@ -540,6 +540,31 @@ const qemuVsockTemplate = `
   guest-cid = "{{.GuestCID}}"
 `
 
+const qemuRngPciTemplate = `
+[object "rng0"]
+  qom-type = "rng-random"
+  filename = "{{.RngBackendPath}}"
+
+[device "virtio-rng0"]
+  driver = "virtio-rng-pci"
+  rng = "rng0"
+  max-bytes = "4096"
+  period = "1000"
+`
+
+const qemuRngMmioTemplate = `
+[object "rng0"]
+  qom-type = "rng-random"
+  filename = "{{.RngBackendPath}}"
+
+[device "virtio-rng0"]
+  driver = "virtio-rng-device"
+  rng = "rng0"
+  bus = "virtio-mmio-bus.0"
+  max-bytes = "4096"
+  period = "1000"
+`
+
 // ivshmem-plain takes its window size from the memory backend rather than
 // from a property of its own, and registers it as 64-bit prefetchable BAR2.
 const qemuIvshmemTemplate = `
@@ -677,13 +702,23 @@ type tQemuVfioPlatformContext struct {
 	Host   string
 }
 
+// Context for qemuRngPciTemplate and qemuRngMmioTemplate.
+type tQemuRngContext struct {
+	RngBackendPath string
+}
+
 var (
 	tQemuGlobalConf, tQemuSwtmp, tQemuVsock              *template.Template
 	tQemuPCIeBridge, tQemuPCIPassthru, tQemuPCIeRootPort *template.Template
 	tQemuDisk, tQemuNet, tQemuSerial, tQemuCANBus        *template.Template
 	tQemuIvshmem                                         *template.Template
 	tQemuVfioPlatform                                    *template.Template
+	tQemuRngPci, tQemuRngMmio                            *template.Template
 )
+
+// rngBackendPath defines the host character device path used as the RNG backend.
+// Defaults to "/dev/urandom", and can be overridden in tests.
+var rngBackendPath = "/dev/urandom"
 
 // Initialize all Go templates used to generate qemu config file.
 func init() {
@@ -699,6 +734,14 @@ func init() {
 	tQemuVsock, err = template.New("qemuVsock").Parse(qemuVsockTemplate)
 	if err != nil {
 		panic(fmt.Errorf("parsing qemuVsockTemplate failed: %w", err))
+	}
+	tQemuRngPci, err = template.New("qemuRngPci").Parse(qemuRngPciTemplate)
+	if err != nil {
+		panic(fmt.Errorf("parsing qemuRngPciTemplate failed: %w", err))
+	}
+	tQemuRngMmio, err = template.New("qemuRngMmio").Parse(qemuRngMmioTemplate)
+	if err != nil {
+		panic(fmt.Errorf("parsing qemuRngMmioTemplate failed: %w", err))
 	}
 	tQemuIvshmem, err = template.New("qemuIvshmem").Parse(qemuIvshmemTemplate)
 	if err != nil {
@@ -855,10 +898,11 @@ func (ctx KvmContext) Task(status *types.DomainStatus) types.Task {
 }
 
 const (
-	// Model cbattr keys parameterising an ivshmem window or UART adapter.
+	// Model cbattr keys parameterising an ivshmem window, UART adapter, or RNG device.
 	ivshmemCbattrPath = "shmpath"
 	ivshmemCbattrSize = "shmsize"
 	uartCbattrKey     = "uart"
+	rngCbattrKey      = "rng"
 	// Used when the model declares a window but gives no size.
 	ivshmemDefaultSize = uint64(16 << 20)
 	// Where a window path is derived when the model carries no shmpath.
@@ -937,10 +981,22 @@ func ivshmemWindowFromBundle(ib types.IoBundle) (*ivshmemWindow, error) {
 		return nil, nil
 	}
 
-	// Mutual exclusion: UART bundles are recognized by the UART parser, not the bulk window parser.
 	uartAttr := ib.Cbattr[uartCbattrKey]
 	shmPath := ib.Cbattr[ivshmemCbattrPath]
 	shmSize := ib.Cbattr[ivshmemCbattrSize]
+	rngAttr := ib.Cbattr[rngCbattrKey]
+
+	if rngAttr != "" && (uartAttr != "" || shmPath != "" || shmSize != "") {
+		return nil, logError("ivshmem window %s: cannot combine rng attribute with uart/shmpath/shmsize", label)
+	}
+	if rngAttr != "" {
+		switch rngAttr {
+		case "pci", "mmio", "off":
+			return nil, nil
+		default:
+			return nil, logError("ivshmem window %s: unsupported rng attribute %q", label, rngAttr)
+		}
+	}
 
 	if uartAttr != "" && (shmPath != "" || shmSize != "") {
 		return nil, logError("ivshmem window %s: cannot combine uart attribute with shmpath/shmsize", label)
@@ -985,12 +1041,26 @@ func uartAdapterFromBundle(ib types.IoBundle) (*uartAdapter, error) {
 	}
 
 	uartAttr := ib.Cbattr[uartCbattrKey]
+	shmPath := ib.Cbattr[ivshmemCbattrPath]
+	shmSize := ib.Cbattr[ivshmemCbattrSize]
+	rngAttr := ib.Cbattr[rngCbattrKey]
+
+	if rngAttr != "" && (uartAttr != "" || shmPath != "" || shmSize != "") {
+		return nil, logError("uart adapter %s: cannot combine rng attribute with uart/shmpath/shmsize", label)
+	}
+	if rngAttr != "" {
+		switch rngAttr {
+		case "pci", "mmio", "off":
+			return nil, nil
+		default:
+			return nil, logError("uart adapter %s: unsupported rng attribute %q", label, rngAttr)
+		}
+	}
+
 	if uartAttr == "" {
 		return nil, nil
 	}
 
-	shmPath := ib.Cbattr[ivshmemCbattrPath]
-	shmSize := ib.Cbattr[ivshmemCbattrSize]
 	if shmPath != "" || shmSize != "" {
 		return nil, logError("uart adapter %s: cannot combine uart attribute with shmpath/shmsize", label)
 	}
@@ -1018,6 +1088,60 @@ func uartAdapterFromBundle(ib types.IoBundle) (*uartAdapter, error) {
 		uartID:     uartAttr,
 		hostDevice: uartHostDevices[uartAttr],
 	}, nil
+}
+
+// resolveRngTransport determines which RNG transport to emit based on assigned bundles.
+// Default for ARM HVM is "pci". If an assigned bundle specifies cbattr {"rng": "mmio"},
+// it selects "mmio". If {"rng": "off"}, it disables RNG emission ("off").
+func resolveRngTransport(domainName string, aa *types.AssignableAdapters,
+	domainAdapterList []types.IoAdapter, domainUUID uuid.UUID) (string, error) {
+	var resolved string
+	if aa == nil {
+		return "pci", nil
+	}
+	for _, adapter := range domainAdapterList {
+		aaList := aa.LookupIoBundleAny(adapter.Name)
+		if len(aaList) == 0 {
+			return "", logError("resolveRngTransport: IoBundle not found %d %s for domain %s (UUID: %s)",
+				adapter.Type, adapter.Name, domainName, domainUUID)
+		}
+		for _, ib := range aaList {
+			if ib == nil {
+				continue
+			}
+			if ib.Type != types.IoOther {
+				continue
+			}
+			rngAttr, hasRng := ib.Cbattr[rngCbattrKey]
+			if !hasRng || rngAttr == "" {
+				continue
+			}
+			uartAttr := ib.Cbattr[uartCbattrKey]
+			shmPath := ib.Cbattr[ivshmemCbattrPath]
+			shmSize := ib.Cbattr[ivshmemCbattrSize]
+			label := ib.Logicallabel
+			if label == "" {
+				label = ib.Phylabel
+			}
+			if uartAttr != "" || shmPath != "" || shmSize != "" {
+				return "", logError("bundle %s: cannot combine rng attribute with uart/shmpath/shmsize", label)
+			}
+			switch rngAttr {
+			case "pci", "mmio", "off":
+				if resolved != "" && resolved != rngAttr {
+					return "", logError("domain %s: conflicting rng attributes %q and %q",
+						domainName, resolved, rngAttr)
+				}
+				resolved = rngAttr
+			default:
+				return "", logError("bundle %s: unsupported rng attribute %q", label, rngAttr)
+			}
+		}
+	}
+	if resolved == "" {
+		return "pci", nil
+	}
+	return resolved, nil
 }
 
 // collectUartAdapters returns the deduplicated set of UART adapters requested by a
@@ -2717,6 +2841,54 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 			allocatedCID = savedLease.Cid
 		} else {
 			allocatedCID = atomic.AddUint32(&clientCid, 1)
+		}
+	}
+
+	// Render VirtIO RNG settings for ARM virt machine (non-OCI container domains).
+	if ctx.devicemodel == "virt" && !config.IsOCIContainer() {
+		rngTransport, err := resolveRngTransport(domainName, aa,
+			config.IoAdapterList, config.UUIDandVersion.UUID)
+		if err != nil {
+			return err
+		}
+		if rngTransport != "off" {
+			fi, err := os.Lstat(rngBackendPath)
+			if err != nil {
+				return logError("RNG backend device %s is missing: %v", rngBackendPath, err)
+			}
+			if fi.Mode()&os.ModeCharDevice == 0 {
+				fileType := "regular file"
+				if fi.IsDir() {
+					fileType = "directory"
+				} else if fi.Mode()&os.ModeSymlink != 0 {
+					fileType = "symlink"
+				} else if fi.Mode()&os.ModeSocket != 0 {
+					fileType = "socket"
+				} else if fi.Mode()&os.ModeNamedPipe != 0 {
+					fileType = "named pipe"
+				} else if fi.Mode()&os.ModeDevice != 0 {
+					fileType = "block device"
+				}
+				return logError("RNG backend path %s is not a character device (type: %s, mode: %s)",
+					rngBackendPath, fileType, fi.Mode().String())
+			}
+
+			rngContext := tQemuRngContext{
+				RngBackendPath: rngBackendPath,
+			}
+			if rngTransport == "mmio" {
+				logrus.Infof("Adding VirtIO RNG MMIO device for domain %s", domainName)
+				if err := tQemuRngMmio.Execute(tmpFile, rngContext); err != nil {
+					return logError("can't write RNG MMIO assignment to config file %s (%v)",
+						tmpFile.Name(), err)
+				}
+			} else {
+				logrus.Infof("Adding VirtIO RNG PCI device for domain %s", domainName)
+				if err := tQemuRngPci.Execute(tmpFile, rngContext); err != nil {
+					return logError("can't write RNG PCI assignment to config file %s (%v)",
+						tmpFile.Name(), err)
+				}
+			}
 		}
 	}
 

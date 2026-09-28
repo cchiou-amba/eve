@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -861,6 +862,16 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
   driver = "pci-serial"
   chardev = "charserial-usr0"
 
+[object "rng0"]
+  qom-type = "rng-random"
+  filename = "/dev/urandom"
+
+[device "virtio-rng0"]
+  driver = "virtio-rng-pci"
+  rng = "rng0"
+  max-bytes = "4096"
+  period = "1000"
+
 [device "eve-vsock0"]
   driver = "vhost-vsock-pci"
   disable-legacy = "on"
@@ -1498,6 +1509,16 @@ func domConfigArm64() string {
 [device "serial-usr0"]
   driver = "pci-serial"
   chardev = "charserial-usr0"
+
+[object "rng0"]
+  qom-type = "rng-random"
+  filename = "/dev/urandom"
+
+[device "virtio-rng0"]
+  driver = "virtio-rng-pci"
+  rng = "rng0"
+  max-bytes = "4096"
+  period = "1000"
 
 [device "eve-vsock0"]
   driver = "vhost-vsock-pci"
@@ -3367,4 +3388,327 @@ func TestPCIAddressAllocator(t *testing.T) {
 	fmt.Println(err.Error())
 	g.Expect(err.Error()).To(ContainSubstring("User-defined network interface order " +
 		"disrupts the function sequence of the multifunction PCI devices 0000:06:00 and 0000:08:00"))
+}
+
+func TestCreateDomConfigRngPciDefault(t *testing.T) {
+	conf, err := os.CreateTemp("/tmp", "config")
+	if err != nil {
+		t.Fatalf("Can't create config file for a domain: %v", err)
+	}
+	defer os.Remove(conf.Name())
+
+	diskConfigs, diskStatuses := qemuDisks()
+	config, aa := domainConfigAndAssignableAdapters(diskConfigs)
+	config.VirtualizationMode = types.HVM
+
+	if err := kvmArm.CreateDomConfig(DefaultDomainName, config, types.DomainStatus{},
+		diskStatuses, &aa, nil, swtpmCtrlSock, conf); err != nil {
+		t.Fatalf("CreateDomConfig failed: %v", err)
+	}
+
+	result, err := os.ReadFile(conf.Name())
+	if err != nil {
+		t.Fatalf("reading conf file failed: %v", err)
+	}
+	content := string(result)
+
+	if !strings.Contains(content, `driver = "virtio-rng-pci"`) {
+		t.Errorf("expected virtio-rng-pci device in default ARM HVM config, got:\n%s", content)
+	}
+	if !strings.Contains(content, `filename = "/dev/urandom"`) {
+		t.Errorf("expected backend filename /dev/urandom in config, got:\n%s", content)
+	}
+	if !strings.Contains(content, `max-bytes = "4096"`) || !strings.Contains(content, `period = "1000"`) {
+		t.Errorf("expected max-bytes=4096 and period=1000 in config, got:\n%s", content)
+	}
+	if strings.Contains(content, `virtio-rng-device`) {
+		t.Errorf("unexpected virtio-rng-device in default config")
+	}
+
+	// Verify RNG appears before eve-vsock0
+	rngIdx := strings.Index(content, `driver = "virtio-rng-pci"`)
+	vsockIdx := strings.Index(content, `driver = "vhost-vsock-pci"`)
+	if rngIdx == -1 || vsockIdx == -1 || rngIdx >= vsockIdx {
+		t.Errorf("virtio-rng-pci must appear immediately before eve-vsock0 (rngIdx: %d, vsockIdx: %d)", rngIdx, vsockIdx)
+	}
+}
+
+func TestCreateDomConfigRngMmio(t *testing.T) {
+	conf, err := os.CreateTemp("/tmp", "config")
+	if err != nil {
+		t.Fatalf("Can't create config file for a domain: %v", err)
+	}
+	defer os.Remove(conf.Name())
+
+	diskConfigs, diskStatuses := qemuDisks()
+	config, aa := domainConfigAndAssignableAdapters(diskConfigs)
+	config.VirtualizationMode = types.HVM
+
+	// Add an adapter requesting MMIO RNG transport
+	config.IoAdapterList = append(config.IoAdapterList, types.IoAdapter{
+		Type: types.IoOther,
+		Name: "rng-mmio",
+	})
+	aa.IoBundleList = append(aa.IoBundleList, types.IoBundle{
+		Type:            types.IoOther,
+		AssignmentGroup: "rng-mmio",
+		Phylabel:        "rng-mmio",
+		Logicallabel:    "rng-mmio",
+		UsedByUUID:      config.UUIDandVersion.UUID,
+		Cbattr:          map[string]string{"rng": "mmio"},
+	})
+
+	if err := kvmArm.CreateDomConfig(DefaultDomainName, config, types.DomainStatus{},
+		diskStatuses, &aa, nil, swtpmCtrlSock, conf); err != nil {
+		t.Fatalf("CreateDomConfig failed: %v", err)
+	}
+
+	result, err := os.ReadFile(conf.Name())
+	if err != nil {
+		t.Fatalf("reading conf file failed: %v", err)
+	}
+	content := string(result)
+
+	if !strings.Contains(content, `driver = "virtio-rng-device"`) {
+		t.Errorf("expected virtio-rng-device in MMIO config, got:\n%s", content)
+	}
+	if !strings.Contains(content, `bus = "virtio-mmio-bus.0"`) {
+		t.Errorf("expected bus = virtio-mmio-bus.0 in MMIO config, got:\n%s", content)
+	}
+	if strings.Contains(content, `virtio-rng-pci`) {
+		t.Errorf("unexpected virtio-rng-pci in MMIO config")
+	}
+}
+
+func TestCreateDomConfigRngOff(t *testing.T) {
+	conf, err := os.CreateTemp("/tmp", "config")
+	if err != nil {
+		t.Fatalf("Can't create config file for a domain: %v", err)
+	}
+	defer os.Remove(conf.Name())
+
+	diskConfigs, diskStatuses := qemuDisks()
+	config, aa := domainConfigAndAssignableAdapters(diskConfigs)
+	config.VirtualizationMode = types.HVM
+
+	// Add an adapter explicitly disabling RNG
+	config.IoAdapterList = append(config.IoAdapterList, types.IoAdapter{
+		Type: types.IoOther,
+		Name: "rng-off",
+	})
+	aa.IoBundleList = append(aa.IoBundleList, types.IoBundle{
+		Type:            types.IoOther,
+		AssignmentGroup: "rng-off",
+		Phylabel:        "rng-off",
+		Logicallabel:    "rng-off",
+		UsedByUUID:      config.UUIDandVersion.UUID,
+		Cbattr:          map[string]string{"rng": "off"},
+	})
+
+	if err := kvmArm.CreateDomConfig(DefaultDomainName, config, types.DomainStatus{},
+		diskStatuses, &aa, nil, swtpmCtrlSock, conf); err != nil {
+		t.Fatalf("CreateDomConfig failed: %v", err)
+	}
+
+	result, err := os.ReadFile(conf.Name())
+	if err != nil {
+		t.Fatalf("reading conf file failed: %v", err)
+	}
+	content := string(result)
+
+	if strings.Contains(content, `virtio-rng-pci`) || strings.Contains(content, `virtio-rng-device`) {
+		t.Errorf("unexpected RNG device in config when rng=off:\n%s", content)
+	}
+}
+
+func TestCreateDomConfigRngOciContainerAndX86Exclusion(t *testing.T) {
+	diskConfigs, diskStatuses := qemuDisks()
+
+	// 1. OCI Container on ARM
+	confOci, err := os.CreateTemp("/tmp", "config-oci")
+	if err != nil {
+		t.Fatalf("Can't create config file: %v", err)
+	}
+	defer os.Remove(confOci.Name())
+
+	configOci, aaOci := domainConfigAndAssignableAdapters(diskConfigs)
+	configOci.VirtualizationMode = types.NOHYPER
+	configOci.DiskConfigList = []types.DiskConfig{{Format: zconfig.Format_CONTAINER}}
+
+	if err := kvmArm.CreateDomConfig(DefaultDomainName, configOci, types.DomainStatus{},
+		diskStatuses, &aaOci, nil, swtpmCtrlSock, confOci); err != nil {
+		t.Fatalf("CreateDomConfig failed for OCI: %v", err)
+	}
+	resOci, _ := os.ReadFile(confOci.Name())
+	if strings.Contains(string(resOci), `virtio-rng`) {
+		t.Errorf("OCI container on ARM must not gain virtio-rng")
+	}
+
+	// 2. x86 machine (pc-q35)
+	confX86, err := os.CreateTemp("/tmp", "config-x86")
+	if err != nil {
+		t.Fatalf("Can't create config file: %v", err)
+	}
+	defer os.Remove(confX86.Name())
+
+	configX86, aaX86 := domainConfigAndAssignableAdapters(diskConfigs)
+	configX86.VirtualizationMode = types.HVM
+
+	if err := kvmIntel.CreateDomConfig(DefaultDomainName, configX86, types.DomainStatus{},
+		diskStatuses, &aaX86, nil, swtpmCtrlSock, confX86); err != nil {
+		t.Fatalf("CreateDomConfig failed for x86: %v", err)
+	}
+	resX86, _ := os.ReadFile(confX86.Name())
+	if strings.Contains(string(resX86), `virtio-rng`) {
+		t.Errorf("x86 machine must not gain virtio-rng")
+	}
+}
+
+func TestCreateDomConfigRngBadBackendPath(t *testing.T) {
+	conf, err := os.CreateTemp("/tmp", "config-good")
+	if err != nil {
+		t.Fatalf("Can't create config file: %v", err)
+	}
+	defer os.Remove(conf.Name())
+
+	// Write initial good content
+	initialContent := "initial valid config\n"
+	if err := os.WriteFile(conf.Name(), []byte(initialContent), 0644); err != nil {
+		t.Fatalf("writing initial config failed: %v", err)
+	}
+
+	// Point rngBackendPath at a regular file
+	regularFile, err := os.CreateTemp("/tmp", "fake-urandom")
+	if err != nil {
+		t.Fatalf("creating regular file failed: %v", err)
+	}
+	defer os.Remove(regularFile.Name())
+
+	origPath := rngBackendPath
+	rngBackendPath = regularFile.Name()
+	defer func() { rngBackendPath = origPath }()
+
+	diskConfigs, diskStatuses := qemuDisks()
+	config, aa := domainConfigAndAssignableAdapters(diskConfigs)
+	config.VirtualizationMode = types.HVM
+
+	err = kvmArm.CreateDomConfig(DefaultDomainName, config, types.DomainStatus{},
+		diskStatuses, &aa, nil, swtpmCtrlSock, conf)
+	if err == nil {
+		t.Fatalf("expected CreateDomConfig to fail when backend path is a regular file")
+	}
+
+	// Confirm initial file was not overwritten
+	savedContent, err := os.ReadFile(conf.Name())
+	if err != nil {
+		t.Fatalf("reading config file failed: %v", err)
+	}
+	if string(savedContent) != initialContent {
+		t.Errorf("expected previous config file to be preserved on failure, got: %s", string(savedContent))
+	}
+}
+
+func TestCreateDomConfigRngInvalidAndConflictingBundles(t *testing.T) {
+	diskConfigs, diskStatuses := qemuDisks()
+
+	// 1. Conflicting bundles (one says pci, one says mmio)
+	conf, _ := os.CreateTemp("/tmp", "config-conflict")
+	defer os.Remove(conf.Name())
+
+	config, aa := domainConfigAndAssignableAdapters(diskConfigs)
+	config.VirtualizationMode = types.HVM
+	config.IoAdapterList = append(config.IoAdapterList,
+		types.IoAdapter{Type: types.IoOther, Name: "rng1"},
+		types.IoAdapter{Type: types.IoOther, Name: "rng2"},
+	)
+	aa.IoBundleList = append(aa.IoBundleList,
+		types.IoBundle{
+			Type:            types.IoOther,
+			AssignmentGroup: "rng1",
+			Phylabel:        "rng1",
+			Logicallabel:    "rng1",
+			UsedByUUID:      config.UUIDandVersion.UUID,
+			Cbattr:          map[string]string{"rng": "pci"},
+		},
+		types.IoBundle{
+			Type:            types.IoOther,
+			AssignmentGroup: "rng2",
+			Phylabel:        "rng2",
+			Logicallabel:    "rng2",
+			UsedByUUID:      config.UUIDandVersion.UUID,
+			Cbattr:          map[string]string{"rng": "mmio"},
+		},
+	)
+
+	err := kvmArm.CreateDomConfig(DefaultDomainName, config, types.DomainStatus{},
+		diskStatuses, &aa, nil, swtpmCtrlSock, conf)
+	if err == nil {
+		t.Errorf("expected error on conflicting rng attributes, got nil")
+	}
+
+	// 2. Combining rng with shmsize
+	conf2, _ := os.CreateTemp("/tmp", "config-shm-rng")
+	defer os.Remove(conf2.Name())
+
+	config2, aa2 := domainConfigAndAssignableAdapters(diskConfigs)
+	config2.VirtualizationMode = types.HVM
+	config2.IoAdapterList = append(config2.IoAdapterList, types.IoAdapter{Type: types.IoOther, Name: "bad-rng"})
+	aa2.IoBundleList = append(aa2.IoBundleList, types.IoBundle{
+		Type:            types.IoOther,
+		AssignmentGroup: "bad-rng",
+		Phylabel:        "bad-rng",
+		Logicallabel:    "bad-rng",
+		UsedByUUID:      config2.UUIDandVersion.UUID,
+		Cbattr:          map[string]string{"rng": "mmio", "shmsize": "1M"},
+	})
+
+	err2 := kvmArm.CreateDomConfig(DefaultDomainName, config2, types.DomainStatus{},
+		diskStatuses, &aa2, nil, swtpmCtrlSock, conf2)
+	if err2 == nil {
+		t.Errorf("expected error when combining rng with shmsize, got nil")
+	}
+
+	// 3. Unknown rng attribute value
+	conf3, _ := os.CreateTemp("/tmp", "config-unknown-rng")
+	defer os.Remove(conf3.Name())
+
+	config3, aa3 := domainConfigAndAssignableAdapters(diskConfigs)
+	config3.VirtualizationMode = types.HVM
+	config3.IoAdapterList = append(config3.IoAdapterList, types.IoAdapter{Type: types.IoOther, Name: "unknown-rng"})
+	aa3.IoBundleList = append(aa3.IoBundleList, types.IoBundle{
+		Type:            types.IoOther,
+		AssignmentGroup: "unknown-rng",
+		Phylabel:        "unknown-rng",
+		Logicallabel:    "unknown-rng",
+		UsedByUUID:      config3.UUIDandVersion.UUID,
+		Cbattr:          map[string]string{"rng": "invalid"},
+	})
+
+	err3 := kvmArm.CreateDomConfig(DefaultDomainName, config3, types.DomainStatus{},
+		diskStatuses, &aa3, nil, swtpmCtrlSock, conf3)
+	if err3 == nil {
+		t.Errorf("expected error for unknown rng attribute 'invalid', got nil")
+	}
+
+	// 4. Combining rng with uart
+	conf4, _ := os.CreateTemp("/tmp", "config-uart-rng")
+	defer os.Remove(conf4.Name())
+
+	config4, aa4 := domainConfigAndAssignableAdapters(diskConfigs)
+	config4.VirtualizationMode = types.HVM
+	config4.IoAdapterList = append(config4.IoAdapterList, types.IoAdapter{Type: types.IoOther, Name: "uart-rng"})
+	aa4.IoBundleList = append(aa4.IoBundleList, types.IoBundle{
+		Type:            types.IoOther,
+		AssignmentGroup: "uart-rng",
+		Phylabel:        "uart-rng",
+		Logicallabel:    "uart-rng",
+		UsedByUUID:      config4.UUIDandVersion.UUID,
+		Cbattr:          map[string]string{"rng": "pci", "uart": "1"},
+	})
+
+	err4 := kvmArm.CreateDomConfig(DefaultDomainName, config4, types.DomainStatus{},
+		diskStatuses, &aa4, nil, swtpmCtrlSock, conf4)
+	if err4 == nil {
+		t.Errorf("expected error when combining rng with uart, got nil")
+	}
 }
