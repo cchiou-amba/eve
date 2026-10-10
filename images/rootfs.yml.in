@@ -10,6 +10,7 @@ init:
   - linuxkit/getty:v1.3.0
   - linuxkit/memlogd:v1.3.0
   - DOM0ZTOOLS_TAG
+  - AMBAVIRT_TAG
   - GRUB_TAG
   - FW_TAG
   - XEN_TAG

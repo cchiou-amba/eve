@@ -1221,9 +1221,10 @@ else
 endif
 
 .PRECIOUS: %.yml
+# AMBAVIRT_TAG is the amba-virt Dom0 layer, built outside this tree; see pkg/amba-virt/Dockerfile.
 %.yml: %.yml.in $(RESCAN_DEPS) $(LINUXKIT)
 	@echo "Building $@ from $<"
-	$(QUIET)$(PARSE_PKGS) $< > $@
+	$(QUIET)$(PARSE_PKGS) $< > $@.tmp && sed 's#AMBAVIRT_TAG#$(AMBAVIRT_TAG)#g' $@.tmp > $@ && rm -f $@.tmp
 	$(QUIET): $@: Succeeded
 
 %/Dockerfile: %/Dockerfile.in $(LINUXKIT) $(RESCAN_DEPS)
