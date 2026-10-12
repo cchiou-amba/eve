@@ -289,6 +289,10 @@ func (ib IoBundle) HasAdapterChanged(log *base.LogObject, phyAdapter PhysicalIOA
 		log.Functionf("Vfs changed from %v to %v", ib.Vfs, phyAdapter.Vfs)
 		return true
 	}
+	if !reflect.DeepEqual(phyAdapter.Cbattr, ib.Cbattr) {
+		log.Functionf("Cbattr changed from %v to %v", ib.Cbattr, phyAdapter.Cbattr)
+		return true
+	}
 	return false
 }
 

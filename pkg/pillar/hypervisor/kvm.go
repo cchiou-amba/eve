@@ -573,7 +573,8 @@ const qemuIvshmemTemplate = `
   mem-path = "{{.MemPath}}"
   size = "{{.Size}}"
   share = "on"
-
+{{if .ReadOnly}}  readonly = "on"
+{{end}}
 [device "{{.ID}}-dev"]
   driver = "ivshmem-plain"
   memdev = "{{.ID}}"
@@ -684,9 +685,10 @@ type tQemuVsockContext struct {
 
 // Context for qemuIvshmemTemplate.
 type tQemuIvshmemContext struct {
-	ID      string
-	MemPath string
-	Size    uint64
+	ID       string
+	MemPath  string
+	Size     uint64
+	ReadOnly bool
 }
 
 // Context for qemuIvshmemDoorbellTemplate.
@@ -899,10 +901,13 @@ func (ctx KvmContext) Task(status *types.DomainStatus) types.Task {
 
 const (
 	// Model cbattr keys parameterising an ivshmem window, UART adapter, or RNG device.
-	ivshmemCbattrPath = "shmpath"
-	ivshmemCbattrSize = "shmsize"
-	uartCbattrKey     = "uart"
-	rngCbattrKey      = "rng"
+	ivshmemCbattrPath   = "shmpath"
+	ivshmemCbattrSize   = "shmsize"
+	ivshmemCbattrAssign = "shmassign"
+	ivshmemAssignServer = "server"
+	ambaVirtAdminSock   = "/run/amba-virt/admin.sock"
+	uartCbattrKey       = "uart"
+	rngCbattrKey        = "rng"
 	// Used when the model declares a window but gives no size.
 	ivshmemDefaultSize = uint64(16 << 20)
 	// Where a window path is derived when the model carries no shmpath.
@@ -915,9 +920,11 @@ const (
 
 // ivshmemWindow is one shared-memory window to expose to a domain.
 type ivshmemWindow struct {
-	id      string
-	memPath string
-	size    uint64
+	id           string
+	memPath      string
+	size         uint64
+	assignServer bool
+	ownerUUID    string
 }
 
 // uartAdapter is one virtualized physical UART adapter to expose to a domain.
@@ -1020,6 +1027,14 @@ func ivshmemWindowFromBundle(ib types.IoBundle) (*ivshmemWindow, error) {
 		}
 		w.size = size
 	}
+	assign := ib.Cbattr[ivshmemCbattrAssign]
+	if assign != "" && assign != ivshmemAssignServer {
+		return nil, logError("ivshmem window %s: unsupported shmassign %q", label, assign)
+	}
+	if assign == ivshmemAssignServer && ib.Cbattr["pool"] == "low" {
+		return nil, nil
+	}
+	w.assignServer = assign == ivshmemAssignServer
 	return &w, nil
 }
 
@@ -1400,6 +1415,213 @@ func uartPassthroughVMMOverhead(domainName string, aa *types.AssignableAdapters,
 	return total, nil
 }
 
+type shmLeaseInfo struct {
+	UUID  string `json:"uuid"`
+	Index uint32 `json:"index"`
+	Epoch uint64 `json:"epoch"`
+	Path  string `json:"path"`
+	Bytes uint64 `json:"bytes"`
+}
+
+func getDomainShmLeaseFile(domainName string) string {
+	return filepath.Join(kvmStateDir+domainName, "shm_lease.json")
+}
+
+func saveShmLease(domainName string, info *shmLeaseInfo) error {
+	dir := kvmStateDir + domainName
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(getDomainShmLeaseFile(domainName), data, 0644)
+}
+
+func loadShmLease(domainName string) *shmLeaseInfo {
+	data, err := os.ReadFile(getDomainShmLeaseFile(domainName))
+	if err != nil {
+		return nil
+	}
+	var info shmLeaseInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return nil
+	}
+	return &info
+}
+
+func adminExchange(cmd string) (string, error) {
+	conn, err := net.DialTimeout("unix", ambaVirtAdminSock, 2*time.Second)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		return "", err
+	}
+	if _, err := io.WriteString(conn, cmd+"\n"); err != nil {
+		return "", err
+	}
+	buf, err := io.ReadAll(conn)
+	if err != nil {
+		return "", err
+	}
+	return string(buf), nil
+}
+
+func parseSliceGrant(resp, uuid string, bytes uint64) (*shmLeaseInfo, error) {
+	fields := strings.Fields(resp)
+	if len(fields) == 0 || fields[0] != "OK" {
+		return nil, fmt.Errorf("%s", strings.TrimSpace(resp))
+	}
+	info := &shmLeaseInfo{UUID: uuid, Bytes: bytes}
+	var sawIndex, sawPath, sawEpoch bool
+	for _, field := range fields[1:] {
+		switch {
+		case strings.HasPrefix(field, "index="):
+			n, err := strconv.ParseUint(strings.TrimPrefix(field, "index="), 10, 32)
+			if err != nil {
+				return nil, err
+			}
+			info.Index = uint32(n)
+			sawIndex = true
+		case strings.HasPrefix(field, "path="):
+			info.Path = strings.TrimPrefix(field, "path=")
+			sawPath = info.Path != ""
+		case strings.HasPrefix(field, "epoch="):
+			n, err := strconv.ParseUint(strings.TrimPrefix(field, "epoch="), 10, 64)
+			if err != nil {
+				return nil, err
+			}
+			info.Epoch = n
+			sawEpoch = true
+		}
+	}
+	if !sawIndex || !sawPath || !sawEpoch {
+		return nil, fmt.Errorf("incomplete slice grant %q", strings.TrimSpace(resp))
+	}
+	return info, nil
+}
+
+func reserveSliceLease(ownerUUID string, bytes uint64, windowID string) (*shmLeaseInfo, error) {
+	var command string
+	if windowID == "amba_shm" {
+		command = fmt.Sprintf("RESERVE_SLICE_AT %s %d 0", ownerUUID, bytes)
+	} else {
+		command = fmt.Sprintf("RESERVE_SLICE_MIN %s %d 1", ownerUUID, bytes)
+	}
+	resp, err := adminExchange(command)
+	if err != nil {
+		return nil, fmt.Errorf("slice reserve: %w", err)
+	}
+	info, err := parseSliceGrant(resp, ownerUUID, bytes)
+	if err != nil {
+		return nil, fmt.Errorf("slice reserve: %w", err)
+	}
+	return info, nil
+}
+
+func releaseSliceGrant(info *shmLeaseInfo) error {
+	if info == nil {
+		return nil
+	}
+	resp, err := adminExchange(fmt.Sprintf("RELEASE_SLICE %s %d", info.UUID, info.Epoch))
+	if err != nil {
+		return err
+	}
+	text := strings.TrimSpace(resp)
+	if text == "OK" || strings.HasPrefix(text, "ERR NOT_FOUND") {
+		return nil
+	}
+	return fmt.Errorf("%s", text)
+}
+
+func getDomainLowLeaseFile(domainName string) string {
+	return filepath.Join(kvmStateDir+domainName, "low_lease.json")
+}
+
+func saveLowLease(domainName string, info *shmLeaseInfo) error {
+	dir := kvmStateDir + domainName
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(getDomainLowLeaseFile(domainName), data, 0644)
+}
+
+func loadLowLease(domainName string) *shmLeaseInfo {
+	data, err := os.ReadFile(getDomainLowLeaseFile(domainName))
+	if err != nil {
+		return nil
+	}
+	var info shmLeaseInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return nil
+	}
+	return &info
+}
+
+func reserveLowLease(ownerUUID string, cid uint32) (*shmLeaseInfo, error) {
+	resp, err := adminExchange(fmt.Sprintf("RESERVE_LOW %s %d", ownerUUID, cid))
+	if err != nil {
+		return nil, fmt.Errorf("low slice reserve: %w", err)
+	}
+	info, err := parseSliceGrant(resp, ownerUUID, 64<<20)
+	if err != nil {
+		return nil, fmt.Errorf("low slice reserve: %w", err)
+	}
+	return info, nil
+}
+
+func releaseLowGrant(info *shmLeaseInfo) error {
+	if info == nil {
+		return nil
+	}
+	resp, err := adminExchange(fmt.Sprintf("RELEASE_LOW %s %d", info.UUID, info.Epoch))
+	if err != nil {
+		return err
+	}
+	text := strings.TrimSpace(resp)
+	if text == "OK" || strings.HasPrefix(text, "ERR NOT_FOUND") {
+		return nil
+	}
+	return fmt.Errorf("%s", text)
+}
+
+func releaseLowLease(domainName string) {
+	info := loadLowLease(domainName)
+	if info == nil {
+		return
+	}
+	if err := releaseLowGrant(info); err != nil {
+		logrus.Warnf("releaseLowLease: domain %s: %v", domainName, err)
+		return
+	}
+	if err := os.Remove(getDomainLowLeaseFile(domainName)); err != nil && !os.IsNotExist(err) {
+		logrus.Warnf("releaseLowLease: remove %s: %v", domainName, err)
+	}
+}
+
+func releaseShmLease(domainName string) {
+	info := loadShmLease(domainName)
+	if info == nil {
+		releaseLowLease(domainName)
+		return
+	}
+	if err := releaseSliceGrant(info); err != nil {
+		logrus.Warnf("releaseShmLease: domain %s: %v", domainName, err)
+		return
+	}
+	if err := os.Remove(getDomainShmLeaseFile(domainName)); err != nil && !os.IsNotExist(err) {
+		logrus.Warnf("releaseShmLease: remove %s: %v", domainName, err)
+	}
+	releaseLowLease(domainName)
+}
+
 // ensureSharedMemoryFile creates and sizes the ivshmem backing file.
 //
 // QEMU's memory-backend-file would create the file itself; doing it here pins
@@ -1483,6 +1705,7 @@ func collectIvshmemWindows(domainName string, aa *types.AssignableAdapters,
 	domainAdapterList []types.IoAdapter, domainUUID uuid.UUID) ([]ivshmemWindow, error) {
 	var windows []ivshmemWindow
 	seen := make(map[string]bool)
+	assigned := 0
 	for _, adapter := range domainAdapterList {
 		aaList := aa.LookupIoBundleAny(adapter.Name)
 		if len(aaList) == 0 {
@@ -1501,6 +1724,13 @@ func collectIvshmemWindows(domainName string, aa *types.AssignableAdapters,
 				continue
 			}
 			seen[w.id] = true
+			w.ownerUUID = domainUUID.String()
+			if w.assignServer {
+				assigned++
+				if assigned > 1 {
+					return nil, logError("domain %s requests more than one server-assigned slice", domainName)
+				}
+			}
 			windows = append(windows, *w)
 		}
 	}
@@ -2481,7 +2711,16 @@ func detectIntelIGPU(adapters []types.IoAdapter, aa *types.AssignableAdapters) b
 func (ctx KvmContext) CreateDomConfig(domainName string,
 	config types.DomainConfig, status types.DomainStatus,
 	diskStatusList []types.DiskStatus, aa *types.AssignableAdapters,
-	globalConfig *types.ConfigItemValueMap, swtpmCtrlSock string, file *os.File) error {
+	globalConfig *types.ConfigItemValueMap, swtpmCtrlSock string, file *os.File) (err error) {
+	var shmAssigned bool
+	var lowAssigned bool
+	defer func() {
+		if err != nil && shmAssigned {
+			releaseShmLease(domainName)
+		} else if err != nil && lowAssigned {
+			releaseLowLease(domainName)
+		}
+	}()
 
 	targetPath := file.Name()
 	tmpFile, err := os.CreateTemp(filepath.Dir(targetPath), filepath.Base(targetPath)+".tmp-*")
@@ -2745,8 +2984,36 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 	if err != nil {
 		return err
 	}
-	for _, w := range ivshmemWindows {
-		if err := ensureSharedMemoryFile(w); err != nil {
+	alreadyHeld := loadShmLease(domainName) != nil
+	var haveCavalry bool
+	var cavalryOwner string
+	for i := range ivshmemWindows {
+		w := &ivshmemWindows[i]
+		if w.assignServer {
+			grant, grantErr := reserveSliceLease(w.ownerUUID, w.size, w.id)
+			if grantErr != nil {
+				return grantErr
+			}
+			if saveErr := saveShmLease(domainName, grant); saveErr != nil {
+				if relErr := releaseSliceGrant(grant); relErr != nil {
+					logrus.Warnf("slice reserve rollback for %s: %v", domainName, relErr)
+				}
+				return saveErr
+			}
+			if !alreadyHeld {
+				shmAssigned = true
+			}
+			w.memPath = grant.Path
+			w.size = grant.Bytes
+			if !haveCavalry {
+				cavalryOwner = w.ownerUUID
+				haveCavalry = true
+			}
+		}
+	}
+	for i := range ivshmemWindows {
+		w := &ivshmemWindows[i]
+		if err = ensureSharedMemoryFile(*w); err != nil {
 			return err
 		}
 		logrus.Infof("Adding ivshmem window <%s> backed by %s (%d bytes)",
@@ -2755,6 +3022,10 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 			ID:      w.id,
 			MemPath: w.memPath,
 			Size:    w.size,
+			// readonly=on opens the node without FMODE_WRITE. The kernel
+			// then clears VM_SHARED, iav_win_mmap returns EINVAL, and
+			// QEMU exits. These BARs stay writable.
+			ReadOnly: false,
 		}
 		if err := tQemuIvshmem.Execute(tmpFile, ivshmemContext); err != nil {
 			return logError("can't write ivshmem assignment to config file %s (%v)",
@@ -2892,6 +3163,37 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 		}
 	}
 
+	// The guest CID exists now. Lease its low slice before QEMU starts,
+	// and keep vsock last so QEMU assigns its PCI id.
+	if haveCavalry && allocatedCID != 0 {
+		low := loadLowLease(domainName)
+		if low == nil {
+			grant, grantErr := reserveLowLease(cavalryOwner, allocatedCID)
+			if grantErr != nil {
+				return grantErr
+			}
+			if saveErr := saveLowLease(domainName, grant); saveErr != nil {
+				if relErr := releaseLowGrant(grant); relErr != nil {
+					logrus.Warnf("low slice rollback for %s: %v", domainName, relErr)
+				}
+				return saveErr
+			}
+			lowAssigned = true
+			low = grant
+		}
+		logrus.Infof("Adding private IAV slice <%s> backed by %s (%d bytes)",
+			domainName, low.Path, low.Bytes)
+		lowContext := tQemuIvshmemContext{
+			ID:      fmt.Sprintf("iav-slice%d", low.Index),
+			MemPath: low.Path,
+			Size:    low.Bytes,
+		}
+		if err = tQemuIvshmem.Execute(tmpFile, lowContext); err != nil {
+			return logError("can't write private IAV slice to config file %s (%v)",
+				tmpFile.Name(), err)
+		}
+	}
+
 	// render vsock settings, this should go last to avoid
 	// PCI ID conflicts, let qemu assign PCI ID for vsock.
 	vsockContext := tQemuVsockContext{
@@ -3010,6 +3312,7 @@ func (ctx KvmContext) Delete(domainName string) (result error) {
 			logrus.Warnf("failed to execute quit command %v (qemu may already be dead)", err)
 		}
 	}
+	releaseShmLease(domainName)
 	releaseDmaLease(domainName)
 	// we may want to wait a little bit here and actually kill qemu process if it gets wedged
 	if err := os.RemoveAll(kvmStateDir + domainName); err != nil {
@@ -3038,6 +3341,7 @@ func (ctx KvmContext) Info(domainName string) (int, types.SwState, error) {
 
 // Cleanup cleans up a domain
 func (ctx KvmContext) Cleanup(domainName string) error {
+	releaseShmLease(domainName)
 	releaseDmaLease(domainName)
 	if err := ctx.ctrdContext.Cleanup(domainName); err != nil {
 		return fmt.Errorf("couldn't cleanup task %s: %v", domainName, err)

@@ -1172,6 +1172,21 @@ func TestHasAdapterChangedUnchanged(t *testing.T) {
 	assert.False(t, ib.HasAdapterChanged(log, phyAdapter))
 }
 
+func TestHasAdapterChangedCbattr(t *testing.T) {
+	log := base.NewSourceLogObject(logrus.StandardLogger(), "test", 1234)
+	ib := IoBundle{
+		Type:     IoOther,
+		Phylabel: "amba_shm",
+		Cbattr:   map[string]string{"shmpath": "/dev/amba_virt_shm", "shmsize": "1G"},
+	}
+	phyAdapter := PhysicalIOAdapter{
+		Ptype:    zcommon.PhyIoType_PhyIoOther,
+		Phylabel: ib.Phylabel,
+		Cbattr:   map[string]string{"shmassign": "server"},
+	}
+	assert.True(t, ib.HasAdapterChanged(log, phyAdapter))
+}
+
 func TestHasAdapterChangedType(t *testing.T) {
 	log := base.NewSourceLogObject(logrus.StandardLogger(), "test", 1234)
 	ib := IoBundle{Type: IoNetEth, Phylabel: "eth0"}
