@@ -905,7 +905,9 @@ const (
 	ivshmemCbattrSize   = "shmsize"
 	ivshmemCbattrAssign = "shmassign"
 	ivshmemAssignServer = "server"
-	ambaVirtAdminSock   = "/run/amba-virt/admin.sock"
+	// cbattr key on a server-assigned ticket: the fleet intent for the shared camera windows
+	// ("on" or "off"; absent means off). amba-virt-server merges it with its own policy.
+	ivshmemCbattrCamera = "camera"
 	uartCbattrKey       = "uart"
 	rngCbattrKey        = "rng"
 	// Used when the model declares a window but gives no size.
@@ -918,6 +920,29 @@ const (
 	ivshmemMinSize = uint64(4096)
 )
 
+// Test injection points. Production values are the defaults.
+var (
+	// The admin socket of amba-virt-server.
+	ambaVirtAdminSock = "/run/amba-virt/admin.sock"
+	// Where the per-domain lease records are kept.
+	domainStateDir = func(domainName string) string { return kvmStateDir + domainName }
+	// The host nodes of the shared camera windows, by the window name amba-virt-server uses.
+	cameraWindowPaths = map[string]string{
+		"dsp": "/dev/amba_virt_iav_dsp",
+		"bsb": "/dev/amba_virt_iav_bsb",
+		"dec": "/dev/amba_virt_iav_dec",
+		"ovl": "/dev/amba_virt_iav_ovl",
+	}
+)
+
+// cameraWindowOrder is the order the windows are emitted in, and the QEMU object id of each.
+var cameraWindowOrder = []struct{ key, id string }{
+	{"dsp", "amba_iav_dsp"},
+	{"bsb", "amba_iav_bsb"},
+	{"dec", "amba_iav_dec"},
+	{"ovl", "amba_iav_ovl"},
+}
+
 // ivshmemWindow is one shared-memory window to expose to a domain.
 type ivshmemWindow struct {
 	id           string
@@ -925,6 +950,9 @@ type ivshmemWindow struct {
 	size         uint64
 	assignServer bool
 	ownerUUID    string
+	// cameraIntent is the fleet intent from the ticket's cbattr: "on", "off" or "absent".
+	// Meaningful for a server-assigned window only.
+	cameraIntent string
 }
 
 // uartAdapter is one virtualized physical UART adapter to expose to a domain.
@@ -1031,11 +1059,33 @@ func ivshmemWindowFromBundle(ib types.IoBundle) (*ivshmemWindow, error) {
 	if assign != "" && assign != ivshmemAssignServer {
 		return nil, logError("ivshmem window %s: unsupported shmassign %q", label, assign)
 	}
+	intent, intentErr := cameraIntentFromCbattr(label, ib.Cbattr[ivshmemCbattrCamera],
+		assign == ivshmemAssignServer)
+	if intentErr != nil {
+		return nil, intentErr
+	}
 	if assign == ivshmemAssignServer && ib.Cbattr["pool"] == "low" {
 		return nil, nil
 	}
 	w.assignServer = assign == ivshmemAssignServer
+	w.cameraIntent = intent
 	return &w, nil
+}
+
+// cameraIntentFromCbattr validates the "camera" cbattr of an ivshmem bundle. Only a server-assigned
+// ticket may carry it, and only as "on" or "off".
+func cameraIntentFromCbattr(label, value string, serverAssigned bool) (string, error) {
+	switch value {
+	case "":
+		return "absent", nil
+	case "on", "off":
+		if !serverAssigned {
+			return "", logError("ivshmem window %s: camera=%s needs shmassign=server", label, value)
+		}
+		return value, nil
+	default:
+		return "", logError("ivshmem window %s: unsupported camera attribute %q", label, value)
+	}
 }
 
 // uartAdapterFromBundle recognises an IoBundle declaring an Ambarella UART adapter
@@ -1236,7 +1286,7 @@ var (
 )
 
 func getDomainLeaseFile(domainName string) string {
-	return filepath.Join(kvmStateDir+domainName, "dma_lease.json")
+	return filepath.Join(domainStateDir(domainName), "dma_lease.json")
 }
 
 func saveDomainLease(domainName string, info *domainDmaLeaseInfo) error {
@@ -1244,7 +1294,7 @@ func saveDomainLease(domainName string, info *domainDmaLeaseInfo) error {
 	domainLeases[domainName] = info
 	domainLeaseLock.Unlock()
 
-	dir := kvmStateDir + domainName
+	dir := domainStateDir(domainName)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
@@ -1421,14 +1471,23 @@ type shmLeaseInfo struct {
 	Epoch uint64 `json:"epoch"`
 	Path  string `json:"path"`
 	Bytes uint64 `json:"bytes"`
+	// Camera lists the shared camera windows amba-virt-server attached to this lease, in
+	// emission order. Empty when the camera is off for this ticket.
+	Camera []cameraWindow `json:"camera,omitempty"`
+}
+
+// cameraWindow is one shared camera window the server attached: key is "dsp", "bsb", "dec" or "ovl".
+type cameraWindow struct {
+	Key  string `json:"key"`
+	Size uint64 `json:"size"`
 }
 
 func getDomainShmLeaseFile(domainName string) string {
-	return filepath.Join(kvmStateDir+domainName, "shm_lease.json")
+	return filepath.Join(domainStateDir(domainName), "shm_lease.json")
 }
 
 func saveShmLease(domainName string, info *shmLeaseInfo) error {
-	dir := kvmStateDir + domainName
+	dir := domainStateDir(domainName)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
@@ -1504,12 +1563,115 @@ func parseSliceGrant(resp, uuid string, bytes uint64) (*shmLeaseInfo, error) {
 	return info, nil
 }
 
-func reserveSliceLease(ownerUUID string, bytes uint64, windowID string) (*shmLeaseInfo, error) {
-	var command string
+// validTicketLabel reports whether label is one amba-virt-server accepts as a ticket name:
+// 1 to 48 characters from [A-Za-z0-9_.-].
+func validTicketLabel(label string) bool {
+	if len(label) < 1 || len(label) > 48 {
+		return false
+	}
+	for i := 0; i < len(label); i++ {
+		c := label[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '_', c == '.', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// reserveSliceCommand builds the reserve request for a ticket. Only the ticket named amba_shm
+// pins Cavalry index 0; every other ticket takes the lowest free index from 1. The digit in
+// amba_shm1 to amba_shm7 is a label for the controller's one-instance-per-group rule, never an index.
+func reserveSliceCommand(ownerUUID string, bytes uint64, windowID, intent string) (string, error) {
+	if !validTicketLabel(windowID) {
+		return "", fmt.Errorf("ticket %q is not a valid name", windowID)
+	}
+	switch intent {
+	case "on", "off", "absent":
+	default:
+		return "", fmt.Errorf("camera intent %q is not on, off or absent", intent)
+	}
 	if windowID == "amba_shm" {
-		command = fmt.Sprintf("RESERVE_SLICE_AT %s %d 0", ownerUUID, bytes)
-	} else {
-		command = fmt.Sprintf("RESERVE_SLICE_MIN %s %d 1", ownerUUID, bytes)
+		return fmt.Sprintf("RESERVE_SLICE_AT %s %d 0 %s %s", ownerUUID, bytes, windowID, intent), nil
+	}
+	return fmt.Sprintf("RESERVE_SLICE_MIN %s %d 1 %s %s", ownerUUID, bytes, windowID, intent), nil
+}
+
+// parseCameraGrant reads the camera verdict of a reserve reply: camera=0|1 and, with camera=1,
+// the sizes of the windows attached. Decode and overlay come only with Cavalry index 0.
+func parseCameraGrant(resp string, index uint32) ([]cameraWindow, error) {
+	fields := strings.Fields(resp)
+	if len(fields) == 0 || fields[0] != "OK" {
+		return nil, fmt.Errorf("%s", strings.TrimSpace(resp))
+	}
+	seen := map[string]bool{}
+	sizes := map[string]uint64{}
+	for _, field := range fields[1:] {
+		key, val, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "camera", "dsp", "bsb", "dec", "ovl":
+		default:
+			continue
+		}
+		if seen[key] {
+			return nil, fmt.Errorf("duplicate %s in slice grant %q", key, strings.TrimSpace(resp))
+		}
+		seen[key] = true
+		if key == "camera" {
+			if val != "0" && val != "1" {
+				return nil, fmt.Errorf("camera=%q in slice grant %q", val, strings.TrimSpace(resp))
+			}
+			if val == "1" {
+				sizes[key] = 1
+			}
+			continue
+		}
+		n, err := strconv.ParseUint(val, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("%s=%q in slice grant: %w", key, val, err)
+		}
+		if n < ivshmemMinSize || n > ivshmemMaxSize || n&(n-1) != 0 {
+			return nil, fmt.Errorf("%s size %d in slice grant is not a power of two between %d and %d",
+				key, n, ivshmemMinSize, ivshmemMaxSize)
+		}
+		sizes[key] = n
+	}
+	if !seen["camera"] {
+		return nil, fmt.Errorf("slice grant %q has no camera verdict", strings.TrimSpace(resp))
+	}
+	if sizes["camera"] == 0 {
+		for _, key := range []string{"dsp", "bsb", "dec", "ovl"} {
+			if seen[key] {
+				return nil, fmt.Errorf("slice grant %q has %s without the camera", strings.TrimSpace(resp), key)
+			}
+		}
+		return nil, nil
+	}
+	if !seen["dsp"] || !seen["bsb"] {
+		return nil, fmt.Errorf("slice grant %q attaches the camera without both dsp and bsb",
+			strings.TrimSpace(resp))
+	}
+	if index != 0 && (seen["dec"] || seen["ovl"]) {
+		return nil, fmt.Errorf("slice grant %q gives decode or overlay to index %d", strings.TrimSpace(resp), index)
+	}
+	var windows []cameraWindow
+	for _, w := range cameraWindowOrder {
+		if seen[w.key] {
+			windows = append(windows, cameraWindow{Key: w.key, Size: sizes[w.key]})
+		}
+	}
+	return windows, nil
+}
+
+func reserveSliceLease(ownerUUID string, bytes uint64, windowID, intent string) (*shmLeaseInfo, error) {
+	command, err := reserveSliceCommand(ownerUUID, bytes, windowID, intent)
+	if err != nil {
+		return nil, fmt.Errorf("slice reserve: %w", err)
 	}
 	resp, err := adminExchange(command)
 	if err != nil {
@@ -1519,7 +1681,30 @@ func reserveSliceLease(ownerUUID string, bytes uint64, windowID string) (*shmLea
 	if err != nil {
 		return nil, fmt.Errorf("slice reserve: %w", err)
 	}
+	info.Camera, err = parseCameraGrant(resp, info.Index)
+	if err != nil {
+		return nil, fmt.Errorf("slice reserve: %w", err)
+	}
 	return info, nil
+}
+
+// cameraWindowsFromGrant turns the windows the server attached into ivshmem windows backed by the
+// one set of host window nodes.
+func cameraWindowsFromGrant(grant *shmLeaseInfo) []ivshmemWindow {
+	var windows []ivshmemWindow
+	for _, cw := range grant.Camera {
+		for _, o := range cameraWindowOrder {
+			if o.key != cw.Key {
+				continue
+			}
+			windows = append(windows, ivshmemWindow{
+				id:      o.id,
+				memPath: cameraWindowPaths[o.key],
+				size:    cw.Size,
+			})
+		}
+	}
+	return windows
 }
 
 func releaseSliceGrant(info *shmLeaseInfo) error {
@@ -1538,11 +1723,11 @@ func releaseSliceGrant(info *shmLeaseInfo) error {
 }
 
 func getDomainLowLeaseFile(domainName string) string {
-	return filepath.Join(kvmStateDir+domainName, "low_lease.json")
+	return filepath.Join(domainStateDir(domainName), "low_lease.json")
 }
 
 func saveLowLease(domainName string, info *shmLeaseInfo) error {
-	dir := kvmStateDir + domainName
+	dir := domainStateDir(domainName)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
@@ -2987,10 +3172,11 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 	alreadyHeld := loadShmLease(domainName) != nil
 	var haveCavalry bool
 	var cavalryOwner string
+	var cameraWindows []ivshmemWindow
 	for i := range ivshmemWindows {
 		w := &ivshmemWindows[i]
 		if w.assignServer {
-			grant, grantErr := reserveSliceLease(w.ownerUUID, w.size, w.id)
+			grant, grantErr := reserveSliceLease(w.ownerUUID, w.size, w.id, w.cameraIntent)
 			if grantErr != nil {
 				return grantErr
 			}
@@ -3009,8 +3195,21 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 				cavalryOwner = w.ownerUUID
 				haveCavalry = true
 			}
+			cameraWindows = append(cameraWindows, cameraWindowsFromGrant(grant)...)
 		}
 	}
+	// The camera windows amba-virt-server attached to the lease. They are not model windows, so
+	// the VMM overhead estimator never sees them: their paths are character devices, which it
+	// does not charge.
+	for _, cw := range cameraWindows {
+		for _, mw := range ivshmemWindows {
+			if mw.memPath == cw.memPath {
+				return logError("domain %s: model window %s and camera window %s are both backed by %s",
+					domainName, mw.id, cw.id, cw.memPath)
+			}
+		}
+	}
+	ivshmemWindows = append(ivshmemWindows, cameraWindows...)
 	for i := range ivshmemWindows {
 		w := &ivshmemWindows[i]
 		if err = ensureSharedMemoryFile(*w); err != nil {
