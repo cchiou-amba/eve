@@ -46,7 +46,45 @@ diff --git a/tools/qemu-xen/hw/vfio/platform.c b/tools/qemu-xen/hw/vfio/platform
 index 5af73f9287..9929f79643 100644
 --- a/tools/qemu-xen/hw/vfio/platform.c
 +++ b/tools/qemu-xen/hw/vfio/platform.c
-@@ -718,3 +718,30 @@ static void register_vfio_platform_dev_type(void)
+@@ -642,15 +642,28 @@ static void vfio_platform_realize(DeviceState *dev, Error **errp)
+         path = g_strdup_printf("%s/of_node/compatible", vbasedev->sysfsdev);
+         if (!g_file_get_contents(path, &contents, &length, &gerr)) {
+-            error_setg(errp, "%s", gerr->message);
+             g_error_free(gerr);
+             g_free(path);
+-            return;
++            /*
++             * No OF compatible property. The xHCI child is created
++             * without an of_node. The kernel stores that device name
++             * only inside VFIO; the vfio-platform host property is the
++             * same name. Use it as the sole compatible string.
++             */
++            if (!vbasedev->name || !vbasedev->name[0]) {
++                error_setg(errp,
++                           "vfio-platform device has no of_node/compatible "
++                           "and no host name");
++                return;
++            }
++            vdev->compat = g_strdup(vbasedev->name);
++            vdev->num_compat = 1;
++        } else {
++            g_free(path);
++            vdev->compat = contents;
++            for (vdev->num_compat = 0; length; vdev->num_compat++) {
++                size_t skip = strlen(contents) + 1;
++                contents += skip;
++                length -= skip;
++            }
+         }
+-        g_free(path);
+-        vdev->compat = contents;
+-        for (vdev->num_compat = 0; length; vdev->num_compat++) {
+-            size_t skip = strlen(contents) + 1;
+-            contents += skip;
+-            length -= skip;
+-        }
+     }
+@@ -718,3 +731,30 @@ static void register_vfio_platform_dev_type(void)
  }
  
  type_init(register_vfio_platform_dev_type)
@@ -113,7 +151,7 @@ index 4156111d49..a2c254de7d 100644
  #include "sysemu/numa.h"
  #include "sysemu/reset.h"
  #include "sysemu/tpm.h"
-@@ -93,6 +94,112 @@ static void acpi_dsdt_add_uart(Aml *scope, const MemMapEntry *uart_memmap,
+@@ -93,6 +94,217 @@ static void acpi_dsdt_add_uart(Aml *scope, const MemMapEntry *uart_memmap,
      aml_append(scope, dev);
  }
  
@@ -122,6 +160,7 @@ index 4156111d49..a2c254de7d 100644
 +    Aml *scope;
 +    PlatformBusDevice *pbus;
 +    uint32_t uart_count;
++    uint32_t usb_count;
 +} DynamicSysbusAcpiContext;
 +
 +static void acpi_dsdt_add_amba_uart(SysBusDevice *sbdev, void *opaque)
@@ -223,10 +262,114 @@ index 4156111d49..a2c254de7d 100644
 +    ctx->uart_count++;
 +}
 +
++static void acpi_dsdt_add_amba_usb(SysBusDevice *sbdev, void *opaque)
++{
++    DynamicSysbusAcpiContext *ctx = opaque;
++    VirtMachineState *vms = ctx->vms;
++    PlatformBusDevice *pbus = ctx->pbus;
++    Aml *scope = ctx->scope;
++    MemoryRegion *mr;
++    hwaddr mmio_offset, absolute_gpa;
++    int irqn;
++    uint32_t intid;
++    char nameseg[5];
++    Aml *dev, *crs, *dsd, *props_list, *prop_base, *prop_size;
++
++    /*
++     * Name match first. A 64 KiB MMIO region is not enough on its own,
++     * and the bare "xhci-hcd" string is not this controller.
++     */
++    if (!vfio_platform_device_has_compatible(sbdev, "xhci-hcd.0.auto")) {
++        return;
++    }
++
++    if (ctx->usb_count >= 10) {
++        error_setg(&error_fatal,
++                   "Too many Ambarella USB devices (maximum 10: USB0-USB9)");
++        return;
++    }
++
++    /* Require MMIO region 0 to exist and have size 0x10000 */
++    if (sbdev->num_mmio < 1) {
++        error_setg(&error_fatal, "Ambarella USB device has no MMIO regions");
++        return;
++    }
++
++    mr = sysbus_mmio_get_region(sbdev, 0);
++    if (!mr || memory_region_size(mr) != 0x10000) {
++        error_setg(&error_fatal,
++                   "Ambarella USB region size mismatch (want 0x10000, got 0x%" PRIx64 ")",
++                   mr ? (uint64_t)memory_region_size(mr) : 0);
++        return;
++    }
++
++    mmio_offset = platform_bus_get_mmio_addr(pbus, sbdev, 0);
++    if (mmio_offset == (hwaddr)-1) {
++        error_setg(&error_fatal,
++                   "Ambarella USB MMIO region 0 not mapped on platform bus");
++        return;
++    }
++
++    absolute_gpa = vms->memmap[VIRT_PLATFORM_BUS].base + mmio_offset;
++    if (absolute_gpa + 0x10000 > UINT32_MAX) {
++        error_setg(&error_fatal,
++                   "Ambarella USB absolute GPA 0x%" PRIx64 " does not fit in Memory32Fixed",
++                   absolute_gpa);
++        return;
++    }
++
++    irqn = platform_bus_get_irqn(pbus, sbdev, 0);
++    if (irqn < 0) {
++        error_setg(&error_fatal,
++                   "Ambarella USB IRQ 0 not mapped on platform bus");
++        return;
++    }
++
++    intid = ARM_SPI_BASE + vms->irqmap[VIRT_PLATFORM_BUS] + irqn;
++
++    snprintf(nameseg, sizeof(nameseg), "USB%u", ctx->usb_count);
++    dev = aml_device("%s", nameseg);
++    aml_append(dev, aml_name_decl("_HID", aml_string("AMBA0002")));
++    aml_append(dev, aml_name_decl("_UID", aml_int(ctx->usb_count)));
++    aml_append(dev, aml_name_decl("_CCA", aml_int(0)));
++
++    crs = aml_resource_template();
++    aml_append(crs, aml_memory32_fixed((uint32_t)absolute_gpa, 0x10000, AML_READ_WRITE));
++    aml_append(crs, aml_interrupt(AML_CONSUMER, AML_LEVEL, AML_ACTIVE_HIGH,
++                                  AML_EXCLUSIVE, &intid, 1));
++    aml_append(dev, aml_name_decl("_CRS", crs));
++
++    /*
++     * _DSD Device Properties UUID: daffd814-6eba-4d8c-8a91-bc9bbf4aa301
++     * Properties:
++     *   "dma-phys-base" = 0x15c00000
++     *   "dma-phys-size" = 0x02000000
++     */
++    prop_base = aml_package(2);
++    aml_append(prop_base, aml_string("dma-phys-base"));
++    aml_append(prop_base, aml_int(0x15c00000));
++
++    prop_size = aml_package(2);
++    aml_append(prop_size, aml_string("dma-phys-size"));
++    aml_append(prop_size, aml_int(0x02000000));
++
++    props_list = aml_package(2);
++    aml_append(props_list, prop_base);
++    aml_append(props_list, prop_size);
++
++    dsd = aml_package(2);
++    aml_append(dsd, aml_touuid("DAFFD814-6EBA-4D8C-8A91-BC9BBF4AA301"));
++    aml_append(dsd, props_list);
++    aml_append(dev, aml_name_decl("_DSD", dsd));
++
++    aml_append(scope, dev);
++    ctx->usb_count++;
++}
++
  static void acpi_dsdt_add_fw_cfg(Aml *scope, const MemMapEntry *fw_cfg_memmap)
  {
      Aml *dev = aml_device("FWCF");
-@@ -893,6 +1000,16 @@ build_dsdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
+@@ -893,6 +1104,18 @@ build_dsdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
      acpi_dsdt_add_tpm(scope, vms);
  #endif
  
@@ -236,8 +379,10 @@ index 4156111d49..a2c254de7d 100644
 +            .scope = scope,
 +            .pbus = PLATFORM_BUS_DEVICE(vms->platform_bus_dev),
 +            .uart_count = 0,
++            .usb_count = 0,
 +        };
 +        foreach_dynamic_sysbus_device(acpi_dsdt_add_amba_uart, &ctx);
++        foreach_dynamic_sysbus_device(acpi_dsdt_add_amba_usb, &ctx);
 +    }
 +
      aml_append(dsdt, scope);

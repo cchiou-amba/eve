@@ -23,6 +23,7 @@ type PhysicalAddress struct {
 	Ioports    string
 	UsbAddr    string
 	UsbProduct string
+	Path       string
 	// unknownType - If a type in config is unknown, store it here.
 	UnknownType string
 }

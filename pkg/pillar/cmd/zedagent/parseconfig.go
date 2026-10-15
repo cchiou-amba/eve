@@ -1647,6 +1647,8 @@ func parseDeviceIoListConfig(getconfigCtx *getconfigContext,
 				port.Phyaddr.UsbAddr = value
 			case "usbproduct":
 				port.Phyaddr.UsbProduct = value
+			case "path":
+				port.Phyaddr.Path = value
 			default:
 				port.Phyaddr.UnknownType = value
 				log.Warnf("Unrecognized Physical address Ignored: "+

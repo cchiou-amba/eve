@@ -1,0 +1,15 @@
+diff --git a/tools/qemu-xen/hw/core/sysbus-fdt.c b/tools/qemu-xen/hw/core/sysbus-fdt.c
+--- a/tools/qemu-xen/hw/core/sysbus-fdt.c
++++ b/tools/qemu-xen/hw/core/sysbus-fdt.c
+@@ -536,6 +536,11 @@
+     TYPE_BINDING(TYPE_VFIO_AMD_XGBE, add_amd_xgbe_fdt_node),
+     VFIO_PLATFORM_BINDING("amd,xgbe-seattle-v1a", add_amd_xgbe_fdt_node),
+     VFIO_PLATFORM_BINDING("ambarella,uart", add_ambarella_uart_fdt_node),
++    /*
++     * xhci-hcd.0.auto has no OF compatible. The guest binds ACPI
++     * AMBA0002, so this sysbus device must not grow an FDT node.
++     */
++    VFIO_PLATFORM_BINDING("xhci-hcd.0.auto", no_fdt_node),
+ #endif
+ #ifdef CONFIG_TPM
+     TYPE_BINDING(TYPE_TPM_TIS_SYSBUS, add_tpm_tis_fdt_node),

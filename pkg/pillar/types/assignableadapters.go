@@ -170,6 +170,7 @@ type IoBundle struct {
 	Serial     string // E.g., "/dev/ttyS1"
 	UsbAddr    string // E.g., "1:2.3"
 	UsbProduct string // E.g., "0951:1666"
+	Path       string // E.g., "xhci-hcd.0.auto"
 
 	// Attributes Derived and assigned locally ( not from controller)
 
@@ -262,6 +263,11 @@ func (ib IoBundle) HasAdapterChanged(log *base.LogObject, phyAdapter PhysicalIOA
 			ib.UsbProduct, phyAdapter.Phyaddr.UsbProduct)
 		return true
 	}
+	if phyAdapter.Phyaddr.Path != ib.Path {
+		log.Functionf("Path changed from %s to %s",
+			ib.Path, phyAdapter.Phyaddr.Path)
+		return true
+	}
 	if phyAdapter.Phyaddr.Irq != ib.Irq {
 		log.Functionf("Irq changed from %s to %s", ib.Irq, phyAdapter.Phyaddr.Irq)
 		return true
@@ -309,6 +315,7 @@ func IoBundleFromPhyAdapter(log *base.LogObject, phyAdapter PhysicalIOAdapter) *
 	ib.PciLong = phyAdapter.Phyaddr.PciLong
 	ib.UsbAddr = phyAdapter.Phyaddr.UsbAddr
 	ib.UsbProduct = phyAdapter.Phyaddr.UsbProduct
+	ib.Path = phyAdapter.Phyaddr.Path
 	ib.Irq = phyAdapter.Phyaddr.Irq
 	ib.Ioports = phyAdapter.Phyaddr.Ioports
 	ib.Serial = phyAdapter.Phyaddr.Serial
