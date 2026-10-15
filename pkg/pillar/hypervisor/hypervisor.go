@@ -243,3 +243,110 @@ func PCISameControllerGeneric(id1 string, id2 string) bool {
 
 	return tag1 == tag2
 }
+
+var (
+	sysfsPlatformDevices      = "/sys/bus/platform/devices"
+	sysfsPlatformDriversProbe = "/sys/bus/platform/drivers_probe"
+	vfioPlatformDriverPath    = "/sys/bus/platform/drivers/vfio-platform"
+	platformSysfsWriteFile    = func(path string, data []byte) error {
+		return os.WriteFile(path, data, 0644)
+	}
+	skipPlatformReleaseRestore = false
+)
+
+func isPlatformBoundToVfio(driverPath string) bool {
+	driverPathInfo, driverPathErr := os.Stat(driverPath)
+	vfioDriverPathInfo, vfioDriverPathErr := os.Stat(vfioPlatformDriverPath)
+	if driverPathErr == nil && vfioDriverPathErr == nil &&
+		os.SameFile(driverPathInfo, vfioDriverPathInfo) {
+		return true
+	}
+	if link, err := os.Readlink(driverPath); err == nil && filepath.Base(link) == "vfio-platform" {
+		return true
+	}
+	return false
+}
+
+// PlatformReserveGeneric binds a platform device (e.g. ffe0018000.uart) to vfio-platform
+// before QEMU starts, rolling back to the original host driver (ambarella-uart) on failure.
+func PlatformReserveGeneric(hostDev string) error {
+	logrus.Infof("PlatformReserve device is %s", hostDev)
+
+	devDir := filepath.Join(sysfsPlatformDevices, hostDev)
+	if _, err := os.Stat(devDir); err != nil {
+		return logError("platform device %s does not exist under %s: %v",
+			hostDev, sysfsPlatformDevices, err)
+	}
+
+	overrideFile := filepath.Join(devDir, "driver_override")
+	driverPath := filepath.Join(devDir, "driver")
+	unbindFile := filepath.Join(driverPath, "unbind")
+
+	if isPlatformBoundToVfio(driverPath) {
+		logrus.Infof("Driver for %s is already bound to vfio-platform, skipping unbind", hostDev)
+		return nil
+	}
+
+	wasBound := false
+	if _, err := os.Stat(unbindFile); err == nil {
+		wasBound = true
+		if err := platformSysfsWriteFile(unbindFile, []byte(hostDev)); err != nil {
+			return logError("unbind failure for platform device %s: %v", hostDev, err)
+		}
+	}
+
+	if err := platformSysfsWriteFile(overrideFile, []byte("vfio-platform")); err != nil {
+		if wasBound {
+			_ = platformSysfsWriteFile(sysfsPlatformDriversProbe, []byte(hostDev))
+		}
+		return logError("driver_override failure for platform device %s: %v", hostDev, err)
+	}
+
+	probeErr := platformSysfsWriteFile(sysfsPlatformDriversProbe, []byte(hostDev))
+	if probeErr != nil || !isPlatformBoundToVfio(driverPath) {
+		_ = platformSysfsWriteFile(overrideFile, []byte("\n"))
+		if wasBound {
+			_ = platformSysfsWriteFile(sysfsPlatformDriversProbe, []byte(hostDev))
+		}
+		if probeErr != nil {
+			return logError("drivers_probe failure for platform device %s: %v", hostDev, probeErr)
+		}
+		return logError("platform device %s failed to bind to vfio-platform", hostDev)
+	}
+
+	return nil
+}
+
+// PlatformReleaseGeneric unbinds vfio-platform, clears driver_override, and re-probes
+// the platform device so the host driver (ambarella-uart) reclaims it.
+func PlatformReleaseGeneric(hostDev string) error {
+	logrus.Infof("PlatformRelease device is %s", hostDev)
+	if skipPlatformReleaseRestore {
+		return nil
+	}
+
+	devDir := filepath.Join(sysfsPlatformDevices, hostDev)
+	if _, err := os.Stat(devDir); err != nil {
+		return logError("platform device %s does not exist under %s: %v",
+			hostDev, sysfsPlatformDevices, err)
+	}
+
+	overrideFile := filepath.Join(devDir, "driver_override")
+	unbindFile := filepath.Join(devDir, "driver", "unbind")
+
+	if err := platformSysfsWriteFile(overrideFile, []byte("\n")); err != nil {
+		return logError("driver_override clear failure for platform device %s: %v", hostDev, err)
+	}
+
+	if _, err := os.Stat(unbindFile); err == nil {
+		if err := platformSysfsWriteFile(unbindFile, []byte(hostDev)); err != nil {
+			return logError("unbind failure for platform device %s: %v", hostDev, err)
+		}
+	}
+
+	if err := platformSysfsWriteFile(sysfsPlatformDriversProbe, []byte(hostDev)); err != nil {
+		return logError("drivers_probe failure for platform device %s: %v", hostDev, err)
+	}
+
+	return nil
+}

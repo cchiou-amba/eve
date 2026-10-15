@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -39,6 +40,14 @@ func init() {
 		devicemodel: "virt",
 		dmExec:      "",
 		dmArgs:      []string{},
+	}
+	allowMockDmaLease = true
+	allowMockPlatformBind = true
+	if os.Getenv("AMBA_TEST_SKIP_UART_RESTORE") == "1" {
+		skipPlatformReleaseRestore = true
+	}
+	if os.Getenv("AMBA_TEST_SKIP_FAILED_START_CLEANUP") == "1" {
+		skipFailedStartCleanupForTest = true
 	}
 }
 
@@ -3710,5 +3719,641 @@ func TestCreateDomConfigRngInvalidAndConflictingBundles(t *testing.T) {
 		diskStatuses, &aa4, nil, swtpmCtrlSock, conf4)
 	if err4 == nil {
 		t.Errorf("expected error when combining rng with uart, got nil")
+	}
+}
+
+type fakePlatformSysfs struct {
+	t                 *testing.T
+	root              string
+	devicesDir        string
+	driversDir        string
+	ambarellaDrvDir   string
+	vfioDrvDir        string
+	driversProbeFile  string
+	unbindCalls       map[string]int
+	failVfioBind      map[string]bool
+	silentFailVfio    map[string]bool
+	allocRequests     []ambaDmaLeaseAlloc
+	ctrlRequests      []ambaDmaLeaseControl
+	nextLeaseID       uint32
+	activeEndpointMap map[uint32]uint32
+}
+
+func setupFakePlatformSysfs(t *testing.T) *fakePlatformSysfs {
+	t.Helper()
+	root := t.TempDir()
+	devicesDir := filepath.Join(root, "devices")
+	driversDir := filepath.Join(root, "drivers")
+	ambarellaDrvDir := filepath.Join(driversDir, "ambarella-uart")
+	vfioDrvDir := filepath.Join(driversDir, "vfio-platform")
+	driversProbeFile := filepath.Join(root, "drivers_probe")
+	stateDirRoot := filepath.Join(root, "state")
+
+	for _, d := range []string{devicesDir, ambarellaDrvDir, vfioDrvDir, stateDirRoot} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	for _, f := range []string{
+		filepath.Join(ambarellaDrvDir, "bind"),
+		filepath.Join(ambarellaDrvDir, "unbind"),
+		filepath.Join(vfioDrvDir, "bind"),
+		filepath.Join(vfioDrvDir, "unbind"),
+		driversProbeFile,
+	} {
+		if err := os.WriteFile(f, nil, 0644); err != nil {
+			t.Fatalf("write %s: %v", f, err)
+		}
+	}
+
+	fakeCtl := filepath.Join(root, "amba_dma_ctl")
+	if err := os.WriteFile(fakeCtl, nil, 0644); err != nil {
+		t.Fatalf("write %s: %v", fakeCtl, err)
+	}
+
+	fs := &fakePlatformSysfs{
+		t:                 t,
+		root:              root,
+		devicesDir:        devicesDir,
+		driversDir:        driversDir,
+		ambarellaDrvDir:   ambarellaDrvDir,
+		vfioDrvDir:        vfioDrvDir,
+		driversProbeFile:  driversProbeFile,
+		unbindCalls:       make(map[string]int),
+		failVfioBind:      make(map[string]bool),
+		silentFailVfio:    make(map[string]bool),
+		activeEndpointMap: make(map[uint32]uint32),
+	}
+
+	origDevices := sysfsPlatformDevices
+	origProbe := sysfsPlatformDriversProbe
+	origVfio := vfioPlatformDriverPath
+	origWrite := platformSysfsWriteFile
+	origMockBind := allowMockPlatformBind
+	origMockLease := allowMockDmaLease
+	origCtl := ambaDmaCtlDev
+	origLeasePathFunc := ambaDmaLeasePathFunc
+	origAllocFunc := ambaDmaIoctlAllocFunc
+	origCtrlFunc := ambaDmaIoctlCtrlFunc
+	origStateDir := domainStateDir
+	origStartHook := kvmStartHook
+
+	sysfsPlatformDevices = devicesDir
+	sysfsPlatformDriversProbe = driversProbeFile
+	vfioPlatformDriverPath = vfioDrvDir
+	allowMockPlatformBind = false
+	allowMockDmaLease = false
+	ambaDmaCtlDev = fakeCtl
+	domainStateDir = func(domainName string) string {
+		return filepath.Join(stateDirRoot, domainName)
+	}
+	// Point lease path at /dev/null (a real char device on Linux) so Lstat ModeCharDevice passes.
+	ambaDmaLeasePathFunc = func(leaseID uint32) string {
+		return "/dev/null"
+	}
+	ambaDmaIoctlAllocFunc = func(fd *os.File, alloc *ambaDmaLeaseAlloc) error {
+		if alloc.EndpointID != 0 {
+			if _, busy := fs.activeEndpointMap[alloc.EndpointID]; busy {
+				return fmt.Errorf("endpoint %d already leased", alloc.EndpointID)
+			}
+		}
+		alloc.LeaseID = fs.nextLeaseID
+		fs.nextLeaseID++
+		alloc.Capability = 0xCAFE0000 + uint64(alloc.LeaseID)
+		alloc.Epoch = 1
+		if alloc.EndpointID != 0 {
+			fs.activeEndpointMap[alloc.EndpointID] = alloc.LeaseID
+		}
+		fs.allocRequests = append(fs.allocRequests, *alloc)
+		return nil
+	}
+	ambaDmaIoctlCtrlFunc = func(fd *os.File, ctrl *ambaDmaLeaseControl) error {
+		fs.ctrlRequests = append(fs.ctrlRequests, *ctrl)
+		if ctrl.Command == ambaDmaCmdRelease {
+			for ep, lid := range fs.activeEndpointMap {
+				if lid == ctrl.LeaseID {
+					delete(fs.activeEndpointMap, ep)
+				}
+			}
+		}
+		return nil
+	}
+	platformSysfsWriteFile = func(path string, data []byte) error {
+		val := strings.TrimSpace(string(data))
+		if strings.HasSuffix(path, "/driver/unbind") {
+			devDir := filepath.Dir(filepath.Dir(path))
+			hostDev := filepath.Base(devDir)
+			fs.unbindCalls[hostDev]++
+			_ = os.Remove(filepath.Join(devDir, "driver"))
+			return nil
+		}
+		if strings.HasSuffix(path, "/driver_override") {
+			return os.WriteFile(path, data, 0644)
+		}
+		if path == driversProbeFile {
+			hostDev := val
+			devDir := filepath.Join(devicesDir, hostDev)
+			ovBytes, err := os.ReadFile(filepath.Join(devDir, "driver_override"))
+			if err != nil {
+				return err
+			}
+			override := strings.TrimSpace(string(ovBytes))
+			driverLink := filepath.Join(devDir, "driver")
+			if override == "vfio-platform" {
+				if fs.failVfioBind[hostDev] {
+					return fmt.Errorf("simulated vfio-platform bind error for %s", hostDev)
+				}
+				if fs.silentFailVfio[hostDev] {
+					return nil
+				}
+				_ = os.Remove(driverLink)
+				return os.Symlink(vfioDrvDir, driverLink)
+			}
+			_ = os.Remove(driverLink)
+			return os.Symlink(ambarellaDrvDir, driverLink)
+		}
+		return os.WriteFile(path, data, 0644)
+	}
+
+	domainLeaseLock.Lock()
+	domainLeases = make(map[string]*domainDmaLeaseInfo)
+	domainUartOwners = make(map[string]string)
+	domainUartState = make(map[string]*domainUartReservation)
+	domainLeaseLock.Unlock()
+
+	t.Cleanup(func() {
+		sysfsPlatformDevices = origDevices
+		sysfsPlatformDriversProbe = origProbe
+		vfioPlatformDriverPath = origVfio
+		platformSysfsWriteFile = origWrite
+		allowMockPlatformBind = origMockBind
+		allowMockDmaLease = origMockLease
+		ambaDmaCtlDev = origCtl
+		ambaDmaLeasePathFunc = origLeasePathFunc
+		ambaDmaIoctlAllocFunc = origAllocFunc
+		ambaDmaIoctlCtrlFunc = origCtrlFunc
+		domainStateDir = origStateDir
+		kvmStartHook = origStartHook
+		domainLeaseLock.Lock()
+		domainLeases = make(map[string]*domainDmaLeaseInfo)
+		domainUartOwners = make(map[string]string)
+		domainUartState = make(map[string]*domainUartReservation)
+		domainLeaseLock.Unlock()
+	})
+
+	return fs
+}
+
+func (fs *fakePlatformSysfs) addDevice(hostDev, driver string) {
+	devDir := filepath.Join(fs.devicesDir, hostDev)
+	if err := os.MkdirAll(devDir, 0755); err != nil {
+		fs.t.Fatalf("mkdir %s: %v", devDir, err)
+	}
+	if err := os.WriteFile(filepath.Join(devDir, "driver_override"), []byte("\n"), 0644); err != nil {
+		fs.t.Fatalf("write driver_override: %v", err)
+	}
+	if driver != "" {
+		target := filepath.Join(fs.driversDir, driver)
+		if err := os.Symlink(target, filepath.Join(devDir, "driver")); err != nil {
+			fs.t.Fatalf("symlink driver: %v", err)
+		}
+	}
+}
+
+func (fs *fakePlatformSysfs) boundDriver(hostDev string) string {
+	link, err := os.Readlink(filepath.Join(fs.devicesDir, hostDev, "driver"))
+	if err != nil {
+		return ""
+	}
+	return filepath.Base(link)
+}
+
+func (fs *fakePlatformSysfs) driverOverride(hostDev string) string {
+	b, err := os.ReadFile(filepath.Join(fs.devicesDir, hostDev, "driver_override"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func makeUartDomainConfig(t *testing.T, uuidStr, uartLabel, uartID string) (string, types.DomainConfig, []types.DiskStatus, types.AssignableAdapters) {
+	t.Helper()
+	diskConfigs, diskStatuses := qemuDisks()
+	config, aa := domainConfigAndAssignableAdapters(diskConfigs)
+	id, err := uuid.FromString(uuidStr)
+	if err != nil {
+		t.Fatalf("bad uuid %s: %v", uuidStr, err)
+	}
+	config.UUIDandVersion.UUID = id
+	config.VirtualizationMode = types.HVM
+	for i := range aa.IoBundleList {
+		aa.IoBundleList[i].UsedByUUID = id
+	}
+	config.IoAdapterList = append(config.IoAdapterList, types.IoAdapter{
+		Type: types.IoOther,
+		Name: uartLabel,
+	})
+	aa.IoBundleList = append(aa.IoBundleList, types.IoBundle{
+		Type:            types.IoOther,
+		AssignmentGroup: uartLabel,
+		Phylabel:        uartLabel,
+		Logicallabel:    uartLabel,
+		Cbattr:          map[string]string{"uart": uartID},
+		UsedByUUID:      id,
+	})
+	return uuidStr + ".0.0", config, diskStatuses, aa
+}
+
+// 1. UART already bound to vfio-platform succeeds without unbinding.
+func TestUartVfioAlreadyBound(t *testing.T) {
+	fs := setupFakePlatformSysfs(t)
+	fs.addDevice("ffe0018000.uart", "vfio-platform")
+
+	if err := PlatformReserveGeneric("ffe0018000.uart"); err != nil {
+		t.Fatalf("expected PlatformReserveGeneric on already-bound vfio-platform device to succeed, got: %v", err)
+	}
+	if fs.unbindCalls["ffe0018000.uart"] != 0 {
+		t.Fatalf("expected 0 unbind calls when already bound to vfio-platform, got %d", fs.unbindCalls["ffe0018000.uart"])
+	}
+	if got := fs.boundDriver("ffe0018000.uart"); got != "vfio-platform" {
+		t.Fatalf("expected driver vfio-platform, got %q", got)
+	}
+}
+
+// 2. Missing platform device under sysfs returns an error.
+func TestUartVfioDeviceMissing(t *testing.T) {
+	fs := setupFakePlatformSysfs(t)
+	_ = fs
+
+	if err := PlatformReserveGeneric("ffe0018000.uart"); err == nil {
+		t.Fatal("expected PlatformReserveGeneric to fail when device is missing from sysfs")
+	}
+
+	domName, config, diskStatuses, aa := makeUartDomainConfig(t, DefaultUUID, "uart2", "2")
+	conf, err := os.CreateTemp(t.TempDir(), "config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conf.Close()
+
+	if err := kvmArm.CreateDomConfig(domName, config, types.DomainStatus{}, diskStatuses, &aa, nil, swtpmCtrlSock, conf); err == nil {
+		t.Fatal("expected CreateDomConfig to fail when UART platform device is missing")
+	}
+}
+
+// 3. Bind failure leaves the host driver (ambarella-uart) in place.
+func TestUartVfioBindFailureRestoresHostDriver(t *testing.T) {
+	fs := setupFakePlatformSysfs(t)
+	fs.addDevice("ffe0018000.uart", "ambarella-uart")
+	fs.failVfioBind["ffe0018000.uart"] = true
+
+	if err := PlatformReserveGeneric("ffe0018000.uart"); err == nil {
+		t.Fatal("expected PlatformReserveGeneric to fail when vfio-platform probe errors")
+	}
+	if got := fs.boundDriver("ffe0018000.uart"); got != "ambarella-uart" {
+		t.Fatalf("expected host driver ambarella-uart to remain bound after bind failure, got %q", got)
+	}
+	if ov := fs.driverOverride("ffe0018000.uart"); ov != "" {
+		t.Fatalf("expected driver_override to be cleared after bind failure, got %q", ov)
+	}
+
+	// Also test silent bind failure (drivers_probe exits 0 without binding vfio-platform).
+	delete(fs.failVfioBind, "ffe0018000.uart")
+	fs.silentFailVfio["ffe0018000.uart"] = true
+	if err := PlatformReserveGeneric("ffe0018000.uart"); err == nil {
+		t.Fatal("expected PlatformReserveGeneric to fail when vfio-platform does not bind")
+	}
+	if got := fs.boundDriver("ffe0018000.uart"); got != "ambarella-uart" {
+		t.Fatalf("expected host driver ambarella-uart to be restored after silent bind failure, got %q", got)
+	}
+}
+
+// 4 & 5. Double start for same domain is idempotent; stop without start is safe.
+func TestUartVfioDoubleStartAndStopWithoutStart(t *testing.T) {
+	fs := setupFakePlatformSysfs(t)
+	fs.addDevice("ffe0018000.uart", "ambarella-uart")
+
+	// Stop without start on never-created domain must not error or disturb ambarella-uart.
+	if err := kvmArm.Stop("never-started.0.0", false); err != nil {
+		t.Fatalf("Stop without start failed: %v", err)
+	}
+	if got := fs.boundDriver("ffe0018000.uart"); got != "ambarella-uart" {
+		t.Fatalf("expected ambarella-uart after stop-without-start, got %q", got)
+	}
+
+	domName, config, diskStatuses, aa := makeUartDomainConfig(t, DefaultUUID, "uart2", "2")
+	conf1, _ := os.CreateTemp(t.TempDir(), "conf1")
+	defer conf1.Close()
+	if err := kvmArm.CreateDomConfig(domName, config, types.DomainStatus{}, diskStatuses, &aa, nil, swtpmCtrlSock, conf1); err != nil {
+		t.Fatalf("first CreateDomConfig failed: %v", err)
+	}
+	if got := fs.boundDriver("ffe0018000.uart"); got != "vfio-platform" {
+		t.Fatalf("expected vfio-platform after first CreateDomConfig, got %q", got)
+	}
+
+	// Double start / second CreateDomConfig for same domain succeeds and keeps vfio-platform bound.
+	conf2, _ := os.CreateTemp(t.TempDir(), "conf2")
+	defer conf2.Close()
+	if err := kvmArm.CreateDomConfig(domName, config, types.DomainStatus{}, diskStatuses, &aa, nil, swtpmCtrlSock, conf2); err != nil {
+		t.Fatalf("second CreateDomConfig (double start) failed: %v", err)
+	}
+	if got := fs.boundDriver("ffe0018000.uart"); got != "vfio-platform" {
+		t.Fatalf("expected vfio-platform after second CreateDomConfig, got %q", got)
+	}
+	if len(fs.allocRequests) != 1 {
+		t.Fatalf("expected lease to be allocated once across double start, got %d", len(fs.allocRequests))
+	}
+
+	if err := kvmArm.Stop(domName, false); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+}
+
+// 6. Stop and forced stop restore ambarella-uart (and fail under AMBA_TEST_SKIP_UART_RESTORE=1).
+func TestUartVfioStopAndForcedStopRestoreHostDriver(t *testing.T) {
+	fs := setupFakePlatformSysfs(t)
+	fs.addDevice("ffe0018000.uart", "ambarella-uart")
+
+	domName, config, diskStatuses, aa := makeUartDomainConfig(t, DefaultUUID, "uart2", "2")
+	conf, _ := os.CreateTemp(t.TempDir(), "conf")
+	defer conf.Close()
+
+	if err := kvmArm.CreateDomConfig(domName, config, types.DomainStatus{}, diskStatuses, &aa, nil, swtpmCtrlSock, conf); err != nil {
+		t.Fatalf("CreateDomConfig failed: %v", err)
+	}
+	if got := fs.boundDriver("ffe0018000.uart"); got != "vfio-platform" {
+		t.Fatalf("expected vfio-platform before Stop, got %q", got)
+	}
+
+	// Graceful stop restores ambarella-uart.
+	if err := kvmArm.Stop(domName, false); err != nil {
+		t.Fatalf("Stop(force=false) failed: %v", err)
+	}
+	if got := fs.boundDriver("ffe0018000.uart"); got != "ambarella-uart" {
+		t.Fatalf("expected ambarella-uart after graceful Stop, got %q", got)
+	}
+
+	// Re-create and test forced stop (force=true).
+	if err := kvmArm.CreateDomConfig(domName, config, types.DomainStatus{}, diskStatuses, &aa, nil, swtpmCtrlSock, conf); err != nil {
+		t.Fatalf("second CreateDomConfig failed: %v", err)
+	}
+	if got := fs.boundDriver("ffe0018000.uart"); got != "vfio-platform" {
+		t.Fatalf("expected vfio-platform before forced Stop, got %q", got)
+	}
+	if err := kvmArm.Stop(domName, true); err != nil {
+		t.Fatalf("Stop(force=true) failed: %v", err)
+	}
+	if got := fs.boundDriver("ffe0018000.uart"); got != "ambarella-uart" {
+		t.Fatalf("expected ambarella-uart after forced Stop, got %q", got)
+	}
+}
+
+// 7. Failed start restores ambarella-uart and clears UsedByUUID on AssignableAdapters
+// (and fails under AMBA_TEST_SKIP_FAILED_START_CLEANUP=1).
+func TestUartVfioFailedStartRestoresDriverAndFreesAdapter(t *testing.T) {
+	fs := setupFakePlatformSysfs(t)
+	fs.addDevice("ffe0018000.uart", "ambarella-uart")
+
+	domName, config, diskStatuses, aa := makeUartDomainConfig(t, DefaultUUID, "uart2", "2")
+	conf, _ := os.CreateTemp(t.TempDir(), "conf")
+	defer conf.Close()
+
+	if err := kvmArm.CreateDomConfig(domName, config, types.DomainStatus{}, diskStatuses, &aa, nil, swtpmCtrlSock, conf); err != nil {
+		t.Fatalf("CreateDomConfig failed: %v", err)
+	}
+	if got := fs.boundDriver("ffe0018000.uart"); got != "vfio-platform" {
+		t.Fatalf("expected vfio-platform after CreateDomConfig, got %q", got)
+	}
+
+	// Inject a Start failure via kvmStartHook (simulating QEMU / containerd start failure).
+	kvmStartHook = func(ctx KvmContext, domainName string) error {
+		return fmt.Errorf("simulated QEMU start failure for %s", domainName)
+	}
+	if err := kvmArm.Start(domName); err == nil {
+		t.Fatal("expected Start to fail")
+	}
+
+	if got := fs.boundDriver("ffe0018000.uart"); got != "ambarella-uart" {
+		t.Fatalf("expected failed Start to restore ambarella-uart, got %q", got)
+	}
+	for _, ib := range aa.IoBundleList {
+		if ib.Phylabel == "uart2" && ib.UsedByUUID != uuid.Nil {
+			t.Fatalf("expected failed Start to clear UsedByUUID on uart2 bundle, still held by %s", ib.UsedByUUID)
+		}
+	}
+	if loadDomainLease(domName) != nil {
+		t.Fatalf("expected failed Start to release DMA lease for %s", domName)
+	}
+}
+
+// 8. Two instances asking for the same UART are refused.
+func TestUartVfioSameUartTwoInstancesRefused(t *testing.T) {
+	fs := setupFakePlatformSysfs(t)
+	fs.addDevice("ffe0018000.uart", "ambarella-uart")
+
+	dom1, cfg1, disks1, aa1 := makeUartDomainConfig(t, DefaultUUID, "uart2", "2")
+	conf1, _ := os.CreateTemp(t.TempDir(), "conf1")
+	defer conf1.Close()
+	if err := kvmArm.CreateDomConfig(dom1, cfg1, types.DomainStatus{}, disks1, &aa1, nil, swtpmCtrlSock, conf1); err != nil {
+		t.Fatalf("dom1 CreateDomConfig failed: %v", err)
+	}
+
+	dom2, cfg2, disks2, aa2 := makeUartDomainConfig(t, "11111111-2222-3333-4444-555555555555", "uart2", "2")
+	conf2, _ := os.CreateTemp(t.TempDir(), "conf2")
+	defer conf2.Close()
+	if err := kvmArm.CreateDomConfig(dom2, cfg2, types.DomainStatus{}, disks2, &aa2, nil, swtpmCtrlSock, conf2); err == nil {
+		t.Fatal("expected second instance asking for the same UART (ffe0018000.uart) to be refused")
+	}
+	if got := fs.boundDriver("ffe0018000.uart"); got != "vfio-platform" {
+		t.Fatalf("expected dom1 vfio-platform binding to remain intact, got %q", got)
+	}
+}
+
+// 9. Requesting a UART that the model does not list in AssignableAdapters is refused.
+func TestUartVfioUnlistedModelUartRefused(t *testing.T) {
+	fs := setupFakePlatformSysfs(t)
+	fs.addDevice("ffe0018000.uart", "ambarella-uart")
+
+	domName, config, diskStatuses, aa := makeUartDomainConfig(t, DefaultUUID, "uart2", "2")
+	// Ask for uart4 which is not in aa.IoBundleList.
+	config.IoAdapterList = append(config.IoAdapterList, types.IoAdapter{
+		Type: types.IoOther,
+		Name: "uart4",
+	})
+	conf, _ := os.CreateTemp(t.TempDir(), "conf")
+	defer conf.Close()
+
+	if err := kvmArm.CreateDomConfig(domName, config, types.DomainStatus{}, diskStatuses, &aa, nil, swtpmCtrlSock, conf); err == nil {
+		t.Fatal("expected CreateDomConfig to fail when requesting unlisted UART adapter uart4")
+	}
+}
+
+// 10 & 11. UART2 and UART3 on different instances at once; lease endpoint is 2 for UART2 and 3 for UART3.
+func TestUartVfioUart2AndUart3ConcurrentAndEndpoints(t *testing.T) {
+	fs := setupFakePlatformSysfs(t)
+	fs.addDevice("ffe0018000.uart", "ambarella-uart")
+	fs.addDevice("ffe0019000.uart", "ambarella-uart")
+
+	domU2, cfgU2, disksU2, aaU2 := makeUartDomainConfig(t, DefaultUUID, "uart2", "2")
+	confU2, _ := os.CreateTemp(t.TempDir(), "conf-u2")
+	defer confU2.Close()
+	if err := kvmArm.CreateDomConfig(domU2, cfgU2, types.DomainStatus{}, disksU2, &aaU2, nil, swtpmCtrlSock, confU2); err != nil {
+		t.Fatalf("UART2 CreateDomConfig failed: %v", err)
+	}
+
+	domU3, cfgU3, disksU3, aaU3 := makeUartDomainConfig(t, "22222222-3333-4444-5555-666666666666", "uart3", "3")
+	confU3, _ := os.CreateTemp(t.TempDir(), "conf-u3")
+	defer confU3.Close()
+	if err := kvmArm.CreateDomConfig(domU3, cfgU3, types.DomainStatus{}, disksU3, &aaU3, nil, swtpmCtrlSock, confU3); err != nil {
+		t.Fatalf("UART3 CreateDomConfig failed: %v", err)
+	}
+
+	if got := fs.boundDriver("ffe0018000.uart"); got != "vfio-platform" {
+		t.Fatalf("expected ffe0018000.uart bound to vfio-platform, got %q", got)
+	}
+	if got := fs.boundDriver("ffe0019000.uart"); got != "vfio-platform" {
+		t.Fatalf("expected ffe0019000.uart bound to vfio-platform, got %q", got)
+	}
+
+	if len(fs.allocRequests) != 2 {
+		t.Fatalf("expected 2 DMA lease alloc requests, got %d", len(fs.allocRequests))
+	}
+	if fs.allocRequests[0].EndpointID != 2 {
+		t.Fatalf("expected UART2 lease EndpointID == 2, got %d", fs.allocRequests[0].EndpointID)
+	}
+	if fs.allocRequests[1].EndpointID != 3 {
+		t.Fatalf("expected UART3 lease EndpointID == 3, got %d", fs.allocRequests[1].EndpointID)
+	}
+
+	// Stopping UART2 domain restores ffe0018000.uart while keeping ffe0019000.uart bound to vfio-platform.
+	if err := kvmArm.Stop(domU2, false); err != nil {
+		t.Fatalf("Stop domU2 failed: %v", err)
+	}
+	if got := fs.boundDriver("ffe0018000.uart"); got != "ambarella-uart" {
+		t.Fatalf("expected ffe0018000.uart restored to ambarella-uart, got %q", got)
+	}
+	if got := fs.boundDriver("ffe0019000.uart"); got != "vfio-platform" {
+		t.Fatalf("expected ffe0019000.uart to remain bound to vfio-platform, got %q", got)
+	}
+
+	if err := kvmArm.Stop(domU3, false); err != nil {
+		t.Fatalf("Stop domU3 failed: %v", err)
+	}
+	if got := fs.boundDriver("ffe0019000.uart"); got != "ambarella-uart" {
+		t.Fatalf("expected ffe0019000.uart restored to ambarella-uart, got %q", got)
+	}
+}
+
+// 12. /dev/amba_dma_ctl absent on a node is an error (not a mock lease), and rolls back vfio-platform bind.
+func TestUartVfioDmaCtlAbsentOnNodeIsError(t *testing.T) {
+	fs := setupFakePlatformSysfs(t)
+	fs.addDevice("ffe0018000.uart", "ambarella-uart")
+
+	ambaDmaCtlDev = filepath.Join(fs.root, "nonexistent_amba_dma_ctl")
+	allowMockDmaLease = false
+
+	domName, config, diskStatuses, aa := makeUartDomainConfig(t, DefaultUUID, "uart2", "2")
+	conf, _ := os.CreateTemp(t.TempDir(), "conf")
+	defer conf.Close()
+
+	err := kvmArm.CreateDomConfig(domName, config, types.DomainStatus{}, diskStatuses, &aa, nil, swtpmCtrlSock, conf)
+	if err == nil {
+		t.Fatal("expected CreateDomConfig to fail when /dev/amba_dma_ctl is absent on node")
+	}
+	if !strings.Contains(err.Error(), "nonexistent_amba_dma_ctl") {
+		t.Fatalf("expected error to mention missing DMA control device, got: %v", err)
+	}
+	if got := fs.boundDriver("ffe0018000.uart"); got != "ambarella-uart" {
+		t.Fatalf("expected ffe0018000.uart restored to ambarella-uart when DMA ctl is absent, got %q", got)
+	}
+	for _, ib := range aa.IoBundleList {
+		if ib.Phylabel == "uart2" && ib.UsedByUUID != uuid.Nil {
+			t.Fatalf("expected UsedByUUID to be cleared on uart2 bundle after DMA ctl failure, got %s", ib.UsedByUUID)
+		}
+	}
+}
+
+func startFakeQmpServer(t *testing.T, sockPath string) func() {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(sockPath), 0755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(sockPath), err)
+	}
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen unix %s: %v", sockPath, err)
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = c.Write([]byte("{\"QMP\":{\"version\":{\"qemu\":{\"micro\":0,\"minor\":0,\"major\":8},\"package\":\"\"},\"capabilities\":[]}}\n"))
+				buf := make([]byte, 1024)
+				for {
+					n, rerr := c.Read(buf)
+					if n > 0 {
+						_, _ = c.Write([]byte("{\"return\":{}}\n"))
+					}
+					if rerr != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+	return func() {
+		_ = ln.Close()
+		_ = os.Remove(sockPath)
+	}
+}
+
+// 13. Graceful Stop while QMP socket exists sends system_powerdown without releasing UART VFIO;
+// UART VFIO is released only after the QMP socket is gone.
+func TestUartVfioStopWithQmpSocketDefersReleaseUntilSocketGone(t *testing.T) {
+	fs := setupFakePlatformSysfs(t)
+	fs.addDevice("ffe0018000.uart", "ambarella-uart")
+
+	shortStateRoot, err := os.MkdirTemp("/tmp", "kvmt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(shortStateRoot) })
+	domainStateDir = func(domainName string) string {
+		return filepath.Join(shortStateRoot, domainName)
+	}
+
+	domName, config, diskStatuses, aa := makeUartDomainConfig(t, DefaultUUID, "uart2", "2")
+	conf, _ := os.CreateTemp(t.TempDir(), "conf")
+	defer conf.Close()
+
+	if err := kvmArm.CreateDomConfig(domName, config, types.DomainStatus{}, diskStatuses, &aa, nil, swtpmCtrlSock, conf); err != nil {
+		t.Fatalf("CreateDomConfig failed: %v", err)
+	}
+	if got := fs.boundDriver("ffe0018000.uart"); got != "vfio-platform" {
+		t.Fatalf("expected vfio-platform after CreateDomConfig, got %q", got)
+	}
+
+	qmpSock := GetQmpExecutorSocket(domName)
+	stopQmp := startFakeQmpServer(t, qmpSock)
+	defer stopQmp()
+
+	// Graceful Stop(domName, false) while QMP socket exists must NOT release vfio-platform.
+	if err := kvmArm.Stop(domName, false); err != nil {
+		t.Fatalf("Stop(force=false) with active QMP socket failed: %v", err)
+	}
+	if got := fs.boundDriver("ffe0018000.uart"); got != "vfio-platform" {
+		t.Fatalf("expected vfio-platform to remain bound while QMP socket exists, got %q", got)
+	}
+
+	// Once QEMU exits and the QMP socket is gone, Stop releases the UART back to ambarella-uart.
+	stopQmp()
+	if err := kvmArm.Stop(domName, false); err != nil {
+		t.Fatalf("Stop(force=false) after QMP socket removal failed: %v", err)
+	}
+	if got := fs.boundDriver("ffe0018000.uart"); got != "ambarella-uart" {
+		t.Fatalf("expected ambarella-uart after QMP socket is gone, got %q", got)
 	}
 }

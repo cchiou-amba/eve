@@ -1254,6 +1254,36 @@ var (
 	ambaDmaLeasePathFunc = func(leaseID uint32) string {
 		return fmt.Sprintf("/dev/amba_dma_lease%d", leaseID)
 	}
+	allowMockDmaLease             = false
+	allowMockPlatformBind         = false
+	skipFailedStartCleanupForTest = false
+	ambaDmaIoctlAllocFunc         = func(fd *os.File, alloc *ambaDmaLeaseAlloc) error {
+		_, _, errno := unix.Syscall(
+			unix.SYS_IOCTL,
+			fd.Fd(),
+			uintptr(ambaDmaIocLeaseAlloc),
+			uintptr(unsafe.Pointer(alloc)),
+		)
+		if errno != 0 {
+			return errno
+		}
+		return nil
+	}
+	ambaDmaIoctlCtrlFunc = func(fd *os.File, ctrl *ambaDmaLeaseControl) error {
+		_, _, errno := unix.Syscall(
+			unix.SYS_IOCTL,
+			fd.Fd(),
+			uintptr(ambaDmaIocLeaseCtrl),
+			uintptr(unsafe.Pointer(ctrl)),
+		)
+		if errno != 0 {
+			return errno
+		}
+		return nil
+	}
+	kvmStartHook = func(ctx KvmContext, domainName string) error {
+		return nil
+	}
 )
 
 type ambaDmaLeaseAlloc struct {
@@ -1261,7 +1291,7 @@ type ambaDmaLeaseAlloc struct {
 	BootGeneration uint32
 	VsockCID       uint32
 	LeaseID        uint32
-	Padding        uint32
+	EndpointID     uint32
 	Capability     uint64
 	Epoch          uint64
 }
@@ -1275,15 +1305,165 @@ type ambaDmaLeaseControl struct {
 }
 
 type domainDmaLeaseInfo struct {
-	LeaseID uint32 `json:"lease_id"`
-	Epoch   uint64 `json:"epoch"`
-	Cid     uint32 `json:"cid"`
+	LeaseID     uint32   `json:"lease_id"`
+	EndpointID  uint32   `json:"endpoint_id,omitempty"`
+	Epoch       uint64   `json:"epoch"`
+	Cid         uint32   `json:"cid"`
+	HostDevices []string `json:"host_devices,omitempty"`
+}
+
+type domainUartReservation struct {
+	domainUUID  uuid.UUID
+	aa          *types.AssignableAdapters
+	hostDevices []string
 }
 
 var (
-	domainLeaseLock sync.Mutex
-	domainLeases    = make(map[string]*domainDmaLeaseInfo)
+	domainLeaseLock  sync.Mutex
+	domainLeases     = make(map[string]*domainDmaLeaseInfo)
+	domainUartOwners = make(map[string]string)
+	domainUartState  = make(map[string]*domainUartReservation)
 )
+
+func uartDmaEndpointID(uartID string) (uint32, error) {
+	switch uartID {
+	case "2":
+		return 2, nil
+	case "3":
+		return 3, nil
+	default:
+		n, err := strconv.ParseUint(uartID, 10, 32)
+		if err != nil || n == 0 {
+			return 0, fmt.Errorf("unsupported DMA endpoint for UART%s", uartID)
+		}
+		return uint32(n), nil
+	}
+}
+
+func hasDomainUartReservation(domainName string) bool {
+	domainLeaseLock.Lock()
+	defer domainLeaseLock.Unlock()
+	_, ok := domainUartState[domainName]
+	return ok
+}
+
+func reserveDomainUarts(domainName string, domainUUID uuid.UUID, aa *types.AssignableAdapters, uarts []uartAdapter) error {
+	if len(uarts) == 0 {
+		return nil
+	}
+
+	domainLeaseLock.Lock()
+	if !allowMockPlatformBind {
+		for _, u := range uarts {
+			if owner, ok := domainUartOwners[u.hostDevice]; ok && owner != domainName {
+				domainLeaseLock.Unlock()
+				return logError("UART host device %s is already bound to domain %s", u.hostDevice, owner)
+			}
+		}
+	}
+	prevRes := domainUartState[domainName]
+	domainLeaseLock.Unlock()
+
+	var newlyBound []string
+	for _, u := range uarts {
+		devDir := filepath.Join(sysfsPlatformDevices, u.hostDevice)
+		if allowMockPlatformBind {
+			if _, err := os.Stat(devDir); os.IsNotExist(err) {
+				continue
+			}
+		}
+		alreadyOwnedBySelf := false
+		if prevRes != nil {
+			for _, prevDev := range prevRes.hostDevices {
+				if prevDev == u.hostDevice {
+					alreadyOwnedBySelf = true
+					break
+				}
+			}
+		}
+		if err := PlatformReserveGeneric(u.hostDevice); err != nil {
+			for _, bound := range newlyBound {
+				_ = PlatformReleaseGeneric(bound)
+			}
+			return err
+		}
+		if !alreadyOwnedBySelf {
+			newlyBound = append(newlyBound, u.hostDevice)
+		}
+	}
+
+	hostDevs := make([]string, 0, len(uarts))
+	domainLeaseLock.Lock()
+	for _, u := range uarts {
+		hostDevs = append(hostDevs, u.hostDevice)
+		domainUartOwners[u.hostDevice] = domainName
+	}
+	domainUartState[domainName] = &domainUartReservation{
+		domainUUID:  domainUUID,
+		aa:          aa,
+		hostDevices: hostDevs,
+	}
+	if info, ok := domainLeases[domainName]; ok && info != nil {
+		info.HostDevices = hostDevs
+	}
+	domainLeaseLock.Unlock()
+	return nil
+}
+
+func releaseDomainUarts(domainName string) {
+	domainLeaseLock.Lock()
+	res := domainUartState[domainName]
+	delete(domainUartState, domainName)
+	var hostDevs []string
+	if res != nil {
+		hostDevs = append(hostDevs, res.hostDevices...)
+	}
+	if info, ok := domainLeases[domainName]; ok && info != nil && len(hostDevs) == 0 {
+		hostDevs = append(hostDevs, info.HostDevices...)
+	}
+	for _, hostDev := range hostDevs {
+		if owner, ok := domainUartOwners[hostDev]; ok && owner == domainName {
+			delete(domainUartOwners, hostDev)
+		}
+	}
+	domainLeaseLock.Unlock()
+
+	for _, hostDev := range hostDevs {
+		devDir := filepath.Join(sysfsPlatformDevices, hostDev)
+		if allowMockPlatformBind {
+			if _, err := os.Stat(devDir); os.IsNotExist(err) {
+				continue
+			}
+		}
+		if err := PlatformReleaseGeneric(hostDev); err != nil {
+			logrus.Warnf("releaseDomainUarts: failed to release %s for domain %s: %v",
+				hostDev, domainName, err)
+		}
+	}
+}
+
+func releaseDomainAdapterReservations(aa *types.AssignableAdapters, domainUUID uuid.UUID) {
+	if aa == nil || domainUUID == uuid.Nil {
+		return
+	}
+	for i := range aa.IoBundleList {
+		if aa.IoBundleList[i].UsedByUUID == domainUUID {
+			aa.IoBundleList[i].UsedByUUID = uuid.Nil
+		}
+	}
+}
+
+func cleanupFailedDomainStart(domainName string) {
+	domainLeaseLock.Lock()
+	res := domainUartState[domainName]
+	domainLeaseLock.Unlock()
+
+	releaseDmaLease(domainName)
+	releaseDomainUarts(domainName)
+	if res != nil {
+		releaseDomainAdapterReservations(res.aa, res.domainUUID)
+	}
+}
 
 func getDomainLeaseFile(domainName string) string {
 	return filepath.Join(domainStateDir(domainName), "dma_lease.json")
@@ -1327,16 +1507,20 @@ func loadDomainLease(domainName string) *domainDmaLeaseInfo {
 	return &info
 }
 
-func allocateDmaLease(domainName string, domainUUID uuid.UUID, cid uint32) (uint32, error) {
-	// If /dev/amba_dma_ctl does not exist (e.g. running in mock test environment), allocate mock lease 0.
-	if _, err := os.Stat(ambaDmaCtlDev); os.IsNotExist(err) {
-		info := &domainDmaLeaseInfo{
-			LeaseID: 0,
-			Epoch:   1,
-			Cid:     cid,
+func allocateDmaLease(domainName string, domainUUID uuid.UUID, cid uint32, endpointID uint32, hostDevices []string) (uint32, error) {
+	if _, err := os.Stat(ambaDmaCtlDev); err != nil {
+		if os.IsNotExist(err) && allowMockDmaLease {
+			info := &domainDmaLeaseInfo{
+				LeaseID:     0,
+				EndpointID:  endpointID,
+				Epoch:       1,
+				Cid:         cid,
+				HostDevices: hostDevices,
+			}
+			_ = saveDomainLease(domainName, info)
+			return 0, nil
 		}
-		_ = saveDomainLease(domainName, info)
-		return 0, nil
+		return 0, fmt.Errorf("DMA control device %s is absent or inaccessible: %w", ambaDmaCtlDev, err)
 	}
 
 	fd, err := os.OpenFile(ambaDmaCtlDev, os.O_RDWR, 0)
@@ -1349,28 +1533,28 @@ func allocateDmaLease(domainName string, domainUUID uuid.UUID, cid uint32) (uint
 	copy(alloc.VmUUID[:], domainUUID[:])
 	alloc.BootGeneration = 1
 	alloc.VsockCID = cid
+	alloc.EndpointID = endpointID
 
-	_, _, errno := unix.Syscall(
-		unix.SYS_IOCTL,
-		fd.Fd(),
-		uintptr(ambaDmaIocLeaseAlloc),
-		uintptr(unsafe.Pointer(&alloc)),
-	)
-	if errno != 0 {
-		return 0, fmt.Errorf("ioctl AMBA_DMA_IOC_LEASE_ALLOC failed: %w", errno)
+	if err := ambaDmaIoctlAllocFunc(fd, &alloc); err != nil {
+		return 0, fmt.Errorf("ioctl AMBA_DMA_IOC_LEASE_ALLOC failed: %w", err)
+	}
+	if alloc.EndpointID == 0 {
+		alloc.EndpointID = endpointID
 	}
 
 	info := &domainDmaLeaseInfo{
-		LeaseID: alloc.LeaseID,
-		Epoch:   alloc.Epoch,
-		Cid:     cid,
+		LeaseID:     alloc.LeaseID,
+		EndpointID:  alloc.EndpointID,
+		Epoch:       alloc.Epoch,
+		Cid:         cid,
+		HostDevices: hostDevices,
 	}
 	if err := saveDomainLease(domainName, info); err != nil {
 		var ctrl ambaDmaLeaseControl
 		ctrl.LeaseID = alloc.LeaseID
 		ctrl.Epoch = alloc.Epoch
 		ctrl.Command = ambaDmaCmdRelease
-		_, _, _ = unix.Syscall(unix.SYS_IOCTL, fd.Fd(), uintptr(ambaDmaIocLeaseCtrl), uintptr(unsafe.Pointer(&ctrl)))
+		_ = ambaDmaIoctlCtrlFunc(fd, &ctrl)
 		return 0, fmt.Errorf("failed to save lease state for domain %s: %w", domainName, err)
 	}
 
@@ -1397,14 +1581,8 @@ func drainDmaLease(domainName string) {
 	ctrl.Epoch = info.Epoch
 	ctrl.Command = ambaDmaCmdDrain
 
-	_, _, errno := unix.Syscall(
-		unix.SYS_IOCTL,
-		fd.Fd(),
-		uintptr(ambaDmaIocLeaseCtrl),
-		uintptr(unsafe.Pointer(&ctrl)),
-	)
-	if errno != 0 {
-		logrus.Warnf("drainDmaLease: LEASE_DRAIN failed for lease %d: %v", info.LeaseID, errno)
+	if err := ambaDmaIoctlCtrlFunc(fd, &ctrl); err != nil {
+		logrus.Warnf("drainDmaLease: LEASE_DRAIN failed for lease %d: %v", info.LeaseID, err)
 	} else {
 		logrus.Infof("drainDmaLease: drained lease %d for domain %s", info.LeaseID, domainName)
 	}
@@ -1435,14 +1613,8 @@ func releaseDmaLease(domainName string) {
 	ctrl.Epoch = info.Epoch
 	ctrl.Command = ambaDmaCmdRelease
 
-	_, _, errno := unix.Syscall(
-		unix.SYS_IOCTL,
-		fd.Fd(),
-		uintptr(ambaDmaIocLeaseCtrl),
-		uintptr(unsafe.Pointer(&ctrl)),
-	)
-	if errno != 0 {
-		logrus.Warnf("releaseDmaLease: LEASE_RELEASE failed for lease %d: %v", info.LeaseID, errno)
+	if err := ambaDmaIoctlCtrlFunc(fd, &ctrl); err != nil {
+		logrus.Warnf("releaseDmaLease: LEASE_RELEASE failed for lease %d: %v", info.LeaseID, err)
 	} else {
 		logrus.Infof("releaseDmaLease: released lease %d for domain %s", info.LeaseID, domainName)
 	}
@@ -1581,7 +1753,7 @@ func validTicketLabel(label string) bool {
 	return true
 }
 
-// reserveSliceCommand builds the reserve request for a ticket. Only the ticket named amba_shm
+// reserveSliceCommand builds the reserve request for a ticket. Only the ticket named amba_shm0
 // pins Cavalry index 0; every other ticket takes the lowest free index from 1. The digit in
 // amba_shm1 to amba_shm7 is a label for the controller's one-instance-per-group rule, never an index.
 func reserveSliceCommand(ownerUUID string, bytes uint64, windowID, intent string) (string, error) {
@@ -1593,7 +1765,7 @@ func reserveSliceCommand(ownerUUID string, bytes uint64, windowID, intent string
 	default:
 		return "", fmt.Errorf("camera intent %q is not on, off or absent", intent)
 	}
-	if windowID == "amba_shm" {
+	if windowID == "amba_shm0" {
 		return fmt.Sprintf("RESERVE_SLICE_AT %s %d 0 %s %s", ownerUUID, bytes, windowID, intent), nil
 	}
 	return fmt.Sprintf("RESERVE_SLICE_MIN %s %d 1 %s %s", ownerUUID, bytes, windowID, intent), nil
@@ -2899,11 +3071,23 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 	globalConfig *types.ConfigItemValueMap, swtpmCtrlSock string, file *os.File) (err error) {
 	var shmAssigned bool
 	var lowAssigned bool
+	var dmaAssigned bool
+	var uartReserved bool
+	hadPriorUartReservation := hasDomainUartReservation(domainName)
 	defer func() {
 		if err != nil && shmAssigned {
 			releaseShmLease(domainName)
 		} else if err != nil && lowAssigned {
 			releaseLowLease(domainName)
+		}
+		if err != nil && !skipFailedStartCleanupForTest && !hadPriorUartReservation {
+			if dmaAssigned {
+				releaseDmaLease(domainName)
+			}
+			if uartReserved {
+				releaseDomainUarts(domainName)
+				releaseDomainAdapterReservations(aa, config.UUIDandVersion.UUID)
+			}
 		}
 	}()
 
@@ -3244,17 +3428,45 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 	var hasUart = len(uartAdapters) > 0
 
 	if hasUart {
+		var endpointID uint32
+		hostDevs := make([]string, 0, len(uartAdapters))
+		for _, u := range uartAdapters {
+			ep, epErr := uartDmaEndpointID(u.uartID)
+			if epErr != nil {
+				return logError("invalid UART adapter %s for domain %s: %v", u.id, domainName, epErr)
+			}
+			if endpointID == 0 {
+				endpointID = ep
+			}
+			hostDevs = append(hostDevs, u.hostDevice)
+		}
+
+		if bindErr := reserveDomainUarts(domainName, config.UUIDandVersion.UUID, aa, uartAdapters); bindErr != nil {
+			if !skipFailedStartCleanupForTest && !hadPriorUartReservation {
+				releaseDomainAdapterReservations(aa, config.UUIDandVersion.UUID)
+			}
+			return logError("failed to bind UART vfio-platform for domain %s: %v", domainName, bindErr)
+		}
+		uartReserved = true
+
 		savedLease := loadDomainLease(domainName)
 		if savedLease != nil {
 			allocatedCID = savedLease.Cid
 			leaseID = savedLease.LeaseID
+			if savedLease.EndpointID == 0 {
+				savedLease.EndpointID = endpointID
+			}
+			if len(savedLease.HostDevices) == 0 {
+				savedLease.HostDevices = hostDevs
+			}
 		} else {
 			allocatedCID = atomic.AddUint32(&clientCid, 1)
 			var leaseErr error
-			leaseID, leaseErr = allocateDmaLease(domainName, config.UUIDandVersion.UUID, allocatedCID)
+			leaseID, leaseErr = allocateDmaLease(domainName, config.UUIDandVersion.UUID, allocatedCID, endpointID, hostDevs)
 			if leaseErr != nil {
 				return logError("failed to allocate DMA lease for domain %s: %v", domainName, leaseErr)
 			}
+			dmaAssigned = true
 		}
 
 		for _, u := range uartAdapters {
@@ -3439,14 +3651,42 @@ func waitForQmp(domainName string, available bool) error {
 }
 
 // Start starts a domain
-func (ctx KvmContext) Start(domainName string) error {
+func (ctx KvmContext) Start(domainName string) (err error) {
 	logrus.Infof("starting KVM domain %s", domainName)
-	if err := ctx.ctrdContext.Start(domainName); err != nil {
+	defer func() {
+		if err != nil && !skipFailedStartCleanupForTest {
+			cleanupFailedDomainStart(domainName)
+		}
+	}()
+
+	domainLeaseLock.Lock()
+	res := domainUartState[domainName]
+	domainLeaseLock.Unlock()
+	if res != nil {
+		for _, hostDev := range res.hostDevices {
+			devDir := filepath.Join(sysfsPlatformDevices, hostDev)
+			if allowMockPlatformBind {
+				if _, statErr := os.Stat(devDir); os.IsNotExist(statErr) {
+					continue
+				}
+			}
+			if err = PlatformReserveGeneric(hostDev); err != nil {
+				return err
+			}
+		}
+	}
+	if kvmStartHook != nil {
+		if err = kvmStartHook(ctx, domainName); err != nil {
+			return err
+		}
+	}
+
+	if err = ctx.ctrdContext.Start(domainName); err != nil {
 		logrus.Errorf("couldn't start task for domain %s: %v", domainName, err)
 		return err
 	}
 	logrus.Infof("done launching qemu device model")
-	if err := waitForQmp(domainName, true); err != nil {
+	if err = waitForQmp(domainName, true); err != nil {
 		logrus.Errorf("Error waiting for Qmp for domain %s: %v", domainName, err)
 		return err
 	}
@@ -3483,12 +3723,17 @@ func (ctx KvmContext) Start(domainName string) error {
 // Stop stops a domain
 func (ctx KvmContext) Stop(domainName string, force bool) error {
 	qmpSock := GetQmpExecutorSocket(domainName)
+	qmpPresent := false
 	if _, err := os.Stat(qmpSock); err == nil {
+		qmpPresent = true
 		if force {
 			execStop(qmpSock)
 			drainDmaLease(domainName)
 			if err := execQuit(qmpSock); err != nil {
 				logrus.Warnf("Stop: failed to execute quit command %v (qemu may already be stopped)", err)
+			}
+			if err := waitForQmp(domainName, false); err != nil {
+				logrus.Warnf("Stop: error waiting for Qmp absent for domain %s: %v", domainName, err)
 			}
 		} else {
 			drainDmaLease(domainName)
@@ -3496,6 +3741,12 @@ func (ctx KvmContext) Stop(domainName string, force bool) error {
 				logrus.Warnf("Stop: failed to execute shutdown command %v (qemu may already be stopped)", err)
 			}
 		}
+	} else {
+		drainDmaLease(domainName)
+	}
+	releaseDmaLease(domainName)
+	if !qmpPresent || force {
+		releaseDomainUarts(domainName)
 	}
 	return nil
 }
@@ -3510,9 +3761,13 @@ func (ctx KvmContext) Delete(domainName string) (result error) {
 		if err = execQuit(qmpSock); err != nil {
 			logrus.Warnf("failed to execute quit command %v (qemu may already be dead)", err)
 		}
+		if waitErr := waitForQmp(domainName, false); waitErr != nil {
+			logrus.Warnf("Delete: error waiting for Qmp absent for domain %s: %v", domainName, waitErr)
+		}
 	}
 	releaseShmLease(domainName)
 	releaseDmaLease(domainName)
+	releaseDomainUarts(domainName)
 	// we may want to wait a little bit here and actually kill qemu process if it gets wedged
 	if err := os.RemoveAll(kvmStateDir + domainName); err != nil {
 		return logError("failed to clean up domain state directory %s (%v)", domainName, err)
@@ -3548,6 +3803,7 @@ func (ctx KvmContext) Cleanup(domainName string) error {
 	if err := waitForQmp(domainName, false); err != nil {
 		return fmt.Errorf("error waiting for Qmp absent for domain %s: %v", domainName, err)
 	}
+	releaseDomainUarts(domainName)
 
 	// Cleanup OVMF settings
 	settingsFile, err := getOVMFSettingsFilename(domainName)
@@ -3587,7 +3843,7 @@ func usbBusPort(USBAddr string) (string, string) {
 
 // GetQmpExecutorSocket returns the path to the qmp socket of a domain
 func GetQmpExecutorSocket(domainName string) string {
-	return filepath.Join(kvmStateDir, domainName, "qmp")
+	return filepath.Join(domainStateDir(domainName), "qmp")
 }
 
 func getQmpListenerSocket(domainName string) string {

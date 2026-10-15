@@ -160,7 +160,7 @@ func countObject(cfg, id string) int {
 func TestCameraTicketLabels(t *testing.T) {
 	long := strings.Repeat("a", 48)
 	for label, want := range map[string]bool{
-		"amba_shm": true, "amba_shm7": true, "a": true, "A-b.c_9": true, long: true,
+		"amba_shm0": true, "amba_shm7": true, "a": true, "A-b.c_9": true, long: true,
 		"": false, "a b": false, "a/b": false, "a\nb": false, "amba_sh\u00e9": false,
 		long + "a": false,
 	} {
@@ -173,14 +173,14 @@ func TestCameraTicketLabels(t *testing.T) {
 func TestCameraReserveCommand(t *testing.T) {
 	const bytes = uint64(1 << 30)
 	for _, tc := range []struct{ label, intent, want string }{
-		{"amba_shm", "on", "RESERVE_SLICE_AT " + cameraTestUUID + " 1073741824 0 amba_shm on"},
-		{"amba_shm", "absent", "RESERVE_SLICE_AT " + cameraTestUUID + " 1073741824 0 amba_shm absent"},
+		{"amba_shm0", "on", "RESERVE_SLICE_AT " + cameraTestUUID + " 1073741824 0 amba_shm0 on"},
+		{"amba_shm0", "absent", "RESERVE_SLICE_AT " + cameraTestUUID + " 1073741824 0 amba_shm0 absent"},
 		{"amba_shm1", "off", "RESERVE_SLICE_MIN " + cameraTestUUID + " 1073741824 1 amba_shm1 off"},
 		{"amba_shm2", "absent", "RESERVE_SLICE_MIN " + cameraTestUUID + " 1073741824 1 amba_shm2 absent"},
 		// The digit is a label, not an index: amba_shm3 must not pin slice 3.
 		{"amba_shm3", "on", "RESERVE_SLICE_MIN " + cameraTestUUID + " 1073741824 1 amba_shm3 on"},
 		{"amba_shm7", "on", "RESERVE_SLICE_MIN " + cameraTestUUID + " 1073741824 1 amba_shm7 on"},
-		{"amba_shm0", "on", "RESERVE_SLICE_MIN " + cameraTestUUID + " 1073741824 1 amba_shm0 on"},
+		{"amba_shm", "on", "RESERVE_SLICE_MIN " + cameraTestUUID + " 1073741824 1 amba_shm on"},
 		{"ticket_9.x-y", "on", "RESERVE_SLICE_MIN " + cameraTestUUID + " 1073741824 1 ticket_9.x-y on"},
 	} {
 		got, err := reserveSliceCommand(cameraTestUUID, bytes, tc.label, tc.intent)
@@ -194,7 +194,7 @@ func TestCameraReserveCommand(t *testing.T) {
 	}
 	for _, tc := range []struct{ label, intent string }{
 		{"", "on"}, {"a b", "on"}, {"a/b", "on"}, {strings.Repeat("a", 49), "on"}, {"amba_sh\u00e9", "on"},
-		{"amba_shm", ""}, {"amba_shm", "ON"}, {"amba_shm", "maybe"},
+		{"amba_shm0", ""}, {"amba_shm0", "ON"}, {"amba_shm0", "maybe"},
 	} {
 		if cmd, err := reserveSliceCommand(cameraTestUUID, bytes, tc.label, tc.intent); err == nil {
 			t.Errorf("%q/%q: got command %q, want an error", tc.label, tc.intent, cmd)
@@ -206,7 +206,7 @@ func TestCameraReserveCommand(t *testing.T) {
 	if _, err := reserveSliceLease(cameraTestUUID, bytes, "bad/label", "on"); err == nil {
 		t.Errorf("reserveSliceLease accepted a bad ticket label")
 	}
-	if _, err := reserveSliceLease(cameraTestUUID, bytes, "amba_shm", "maybe"); err == nil {
+	if _, err := reserveSliceLease(cameraTestUUID, bytes, "amba_shm0", "maybe"); err == nil {
 		t.Errorf("reserveSliceLease accepted a bad intent")
 	}
 	if n := len(f.seen()); n != 0 {
@@ -368,7 +368,7 @@ func TestCameraCreateDomConfigOnIndexOne(t *testing.T) {
 func TestCameraCreateDomConfigOnIndexZero(t *testing.T) {
 	cameraTestEnv(t)
 	f := startFakeAdmin(t, cameraServer(" camera=1 dsp=1073741824 bsb=16777216 dec=8388608 ovl=8388608"))
-	config, aa, disks := cameraDomain(t, "amba_shm", map[string]string{
+	config, aa, disks := cameraDomain(t, "amba_shm0", map[string]string{
 		"shmassign": "server", "shmsize": "1G", "camera": "on"})
 
 	cfg, err := renderCameraConfig(t, config, aa, disks)
@@ -387,12 +387,12 @@ func TestCameraCreateDomConfigOnIndexZero(t *testing.T) {
 	}
 	var at bool
 	for _, r := range f.seen() {
-		if strings.HasPrefix(r, "RESERVE_SLICE_AT ") && strings.HasSuffix(r, " 0 amba_shm on") {
+		if strings.HasPrefix(r, "RESERVE_SLICE_AT ") && strings.HasSuffix(r, " 0 amba_shm0 on") {
 			at = true
 		}
 	}
 	if !at {
-		t.Errorf("no RESERVE_SLICE_AT ... 0 amba_shm on in %v", f.seen())
+		t.Errorf("no RESERVE_SLICE_AT ... 0 amba_shm0 on in %v", f.seen())
 	}
 }
 
