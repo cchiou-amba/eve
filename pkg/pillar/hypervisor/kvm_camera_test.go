@@ -82,13 +82,16 @@ func cameraTestEnv(t *testing.T) {
 	dir := t.TempDir()
 	oldDir := domainStateDir
 	oldPaths := cameraWindowPaths
+	oldAux := auxWindowPath
 	domainStateDir = func(domainName string) string { return filepath.Join(dir, domainName) }
 	cameraWindowPaths = map[string]string{
 		"dsp": "/dev/zero", "bsb": "/dev/full", "dec": "/dev/random", "ovl": "/dev/urandom",
 	}
+	auxWindowPath = func(index uint32) string { return "/dev/ptmx" }
 	t.Cleanup(func() {
 		domainStateDir = oldDir
 		cameraWindowPaths = oldPaths
+		auxWindowPath = oldAux
 	})
 }
 
@@ -251,14 +254,26 @@ func TestCameraGrantParse(t *testing.T) {
 		{"not a power of two", 1, grant(1, " camera=1 dsp=3000 bsb=16777216"), "", "power of two"},
 		{"over the maximum", 1, grant(1, " camera=1 dsp=137438953472 bsb=16777216"), "", "power of two"},
 		{"not a number", 1, grant(1, " camera=1 dsp=abc bsb=16777216"), "", "dsp="},
-		{"decode for a consumer", 1, grant(1, " camera=1 dsp=1073741824 bsb=16777216 dec=8388608"), "", "decode or overlay"},
-		{"overlay for a consumer", 1, grant(1, " camera=1 dsp=1073741824 bsb=16777216 ovl=8388608"), "", "decode or overlay"},
+		{"decode for a consumer", 1, grant(1, " camera=1 dsp=1073741824 bsb=16777216 dec=8388608 role=consumer"), "", "decode or overlay"},
+		{"overlay for a consumer", 1, grant(1, " camera=1 dsp=1073741824 bsb=16777216 ovl=8388608 role=consumer"), "", "decode or overlay"},
+		{"decode for a consumer at index 0", 0, grant(0, " camera=1 dsp=1073741824 bsb=16777216 dec=8388608 role=consumer"), "", "decode or overlay"},
+		// The role is the ticket's, not the index's: a primary at index 3 gets decode and overlay.
+		{"primary at another index", 3, grant(3, " camera=1 dsp=1073741824 bsb=16777216 dec=8388608 ovl=8388608 role=primary"), "dsp,bsb,dec,ovl", ""},
+		{"consumer role at index 0", 0, grant(0, " camera=1 dsp=1073741824 bsb=16777216 role=consumer"), "dsp,bsb", ""},
+		{"camera off with a role", 2, grant(2, " camera=0 role=primary"), "", ""},
+		{"a server that sends no role is taken at its word", 1, grant(1, " camera=1 dsp=1073741824 bsb=16777216 dec=8388608"), "dsp,bsb,dec", ""},
+		{"unknown role", 1, grant(1, " camera=1 dsp=1073741824 bsb=16777216 role=admin"), "", "role="},
+		{"empty role", 1, grant(1, " camera=1 dsp=1073741824 bsb=16777216 role="), "", "role="},
+		{"duplicate role", 0, grant(0, " camera=1 dsp=1073741824 bsb=16777216 role=primary role=consumer"), "", "duplicate role"},
 		{"duplicate window", 1, grant(1, " camera=1 dsp=1073741824 dsp=1073741824 bsb=16777216"), "", "duplicate dsp"},
 		{"duplicate camera", 1, grant(1, " camera=1 camera=1 dsp=1073741824 bsb=16777216"), "", "duplicate camera"},
 		{"server error", 1, "ERR EXHAUSTED\n", "", "ERR EXHAUSTED"},
 		{"empty", 1, "", "", "slice reserve"},
 	} {
-		got, err := parseCameraGrant(tc.resp, uint32(tc.index))
+		got, role, err := parseCameraGrant(tc.resp)
+		if err == nil && strings.Contains(tc.resp, "role=primary") != (role == "primary") {
+			t.Errorf("%s: role %q from %q", tc.name, role, tc.resp)
+		}
 		if tc.fail != "" {
 			if err == nil {
 				t.Errorf("%s: got windows %v, want an error containing %q", tc.name, keys(got), tc.fail)
@@ -278,7 +293,7 @@ func TestCameraGrantParse(t *testing.T) {
 		}
 	}
 	// Sizes are carried through.
-	w, err := parseCameraGrant(grant(0, " camera=1 dsp=1073741824 bsb=16777216 dec=8388608 ovl=4194304"), 0)
+	w, _, err := parseCameraGrant(grant(0, " camera=1 dsp=1073741824 bsb=16777216 dec=8388608 ovl=4194304"))
 	if err != nil || len(w) != 4 || w[0].Size != 1<<30 || w[1].Size != 16<<20 || w[2].Size != 8<<20 || w[3].Size != 4<<20 {
 		t.Errorf("sizes not carried: %+v, %v", w, err)
 	}
@@ -549,5 +564,99 @@ func TestCameraEstimatorIgnoresCameraWindows(t *testing.T) {
 	}
 	if n := len(f.seen()); n != 0 {
 		t.Errorf("the estimator asked the server %d times, want 0", n)
+	}
+}
+
+func TestCameraAuxGrantParse(t *testing.T) {
+	const base = "OK index=0 path=/dev/amba_virt_shm0 epoch=3"
+	for _, tc := range []struct {
+		name string
+		resp string
+		want uint64
+		fail string
+	}{
+		{"none", base + " camera=1 dsp=1073741824 bsb=16777216 role=primary", 0, ""},
+		{"primary", base + " camera=1 dsp=1073741824 bsb=16777216 dec=8388608 ovl=8388608 aux=67108864 role=primary", 64 << 20, ""},
+		{"a server that sends no role", base + " camera=1 dsp=1073741824 bsb=16777216 aux=67108864", 64 << 20, ""},
+		{"any order", base + " aux=67108864 camera=1 dsp=1073741824 bsb=16777216", 64 << 20, ""},
+		{"without the camera", base + " camera=0 aux=67108864", 0, "without the camera"},
+		{"for a consumer", base + " camera=1 dsp=1073741824 bsb=16777216 aux=67108864 role=consumer", 0, "consumer"},
+		{"duplicate", base + " camera=1 dsp=1073741824 bsb=16777216 aux=67108864 aux=67108864", 0, "duplicate aux"},
+		{"not a power of two", base + " camera=1 dsp=1073741824 bsb=16777216 aux=67108865", 0, "power of two"},
+		{"too small", base + " camera=1 dsp=1073741824 bsb=16777216 aux=2048", 0, "power of two"},
+		{"too large", base + " camera=1 dsp=1073741824 bsb=16777216 aux=137438953472", 0, "power of two"},
+		{"not a number", base + " camera=1 dsp=1073741824 bsb=16777216 aux=-1", 0, "aux="},
+		{"empty", base + " camera=1 dsp=1073741824 bsb=16777216 aux=", 0, "aux="},
+	} {
+		role := ""
+		if strings.Contains(tc.resp, "role=consumer") {
+			role = "consumer"
+		}
+		got, err := parseAuxGrant(tc.resp, role)
+		if tc.fail != "" {
+			if err == nil || !strings.Contains(err.Error(), tc.fail) {
+				t.Errorf("%s: got %d, %v; want an error containing %q", tc.name, got, err, tc.fail)
+			}
+			continue
+		}
+		if err != nil || got != tc.want {
+			t.Errorf("%s: got %d, %v; want %d", tc.name, got, err, tc.want)
+		}
+	}
+}
+
+func TestCameraCreateDomConfigWithAux(t *testing.T) {
+	cameraTestEnv(t)
+	var asked uint32 = 99
+	auxWindowPath = func(index uint32) string {
+		asked = index
+		return "/dev/ptmx"
+	}
+	startFakeAdmin(t, cameraServer(" camera=1 dsp=1073741824 bsb=16777216 dec=8388608 ovl=8388608 aux=67108864 role=primary"))
+	config, aa, disks := cameraDomain(t, "amba_shm0", map[string]string{
+		"shmassign": "server", "shmsize": "1G", "camera": "on"})
+
+	cfg, err := renderCameraConfig(t, config, aa, disks)
+	if err != nil {
+		t.Fatalf("CreateDomConfig failed: %v", err)
+	}
+	if countObject(cfg, auxWindowID) != 1 {
+		t.Errorf("config has %d objects %q, want 1:\n%s", countObject(cfg, auxWindowID), auxWindowID, cfg)
+	}
+	if !strings.Contains(cfg, `size = "67108864"`) || !strings.Contains(cfg, `mem-path = "/dev/ptmx"`) {
+		t.Errorf("the aux aperture is not backed by its node with its size:\n%s", cfg)
+	}
+	if asked != 0 {
+		t.Errorf("the aux node of index %d was used, want the lease's index 0", asked)
+	}
+	// The lease record keeps it, so a restart of the same domain attaches it again.
+	if info := loadShmLease(DefaultDomainName); info == nil || info.Aux != 64<<20 {
+		t.Errorf("lease record %+v, want aux 67108864", info)
+	}
+}
+
+func TestCameraCreateDomConfigConsumerHasNoAux(t *testing.T) {
+	cameraTestEnv(t)
+	startFakeAdmin(t, cameraServer(" camera=1 dsp=1073741824 bsb=16777216 role=consumer"))
+	config, aa, disks := cameraDomain(t, "amba_shm1", map[string]string{
+		"shmassign": "server", "shmsize": "1G", "camera": "on"})
+
+	cfg, err := renderCameraConfig(t, config, aa, disks)
+	if err != nil {
+		t.Fatalf("CreateDomConfig failed: %v", err)
+	}
+	if countObject(cfg, auxWindowID) != 0 {
+		t.Errorf("a consumer got the aux aperture:\n%s", cfg)
+	}
+}
+
+func TestCameraAuxForAConsumerIsRefused(t *testing.T) {
+	cameraTestEnv(t)
+	startFakeAdmin(t, cameraServer(" camera=1 dsp=1073741824 bsb=16777216 aux=67108864 role=consumer"))
+	config, aa, disks := cameraDomain(t, "amba_shm1", map[string]string{
+		"shmassign": "server", "shmsize": "1G", "camera": "on"})
+
+	if _, err := renderCameraConfig(t, config, aa, disks); err == nil {
+		t.Errorf("a grant that gives the aux aperture to a consumer was accepted")
 	}
 }

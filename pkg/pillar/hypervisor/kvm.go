@@ -960,7 +960,12 @@ var (
 		"dec": "/dev/amba_virt_iav_dec",
 		"ovl": "/dev/amba_virt_iav_ovl",
 	}
+	// The host node of the aux aperture of a Cavalry lease index (one node per index).
+	auxWindowPath = func(index uint32) string { return fmt.Sprintf("/dev/amba_virt_iav_aux%d", index) }
 )
+
+// auxWindowID is the QEMU object id of the aux aperture.
+const auxWindowID = "amba_iav_aux"
 
 // cameraWindowOrder is the order the windows are emitted in, and the QEMU object id of each.
 var cameraWindowOrder = []struct{ key, id string }{
@@ -1727,6 +1732,12 @@ type shmLeaseInfo struct {
 	// Camera lists the shared camera windows amba-virt-server attached to this lease, in
 	// emission order. Empty when the camera is off for this ticket.
 	Camera []cameraWindow `json:"camera,omitempty"`
+	// Role is the virtual /dev/iav role amba-virt-server holds for the ticket: "primary" or
+	// "consumer"; empty from a server that does not send it.
+	Role string `json:"role,omitempty"`
+	// Aux is the size of the aux aperture amba-virt-server composed for this lease (the node of
+	// the lease's index); 0 when it attached none.
+	Aux uint64 `json:"aux,omitempty"`
 }
 
 // cameraWindow is one shared camera window the server attached: key is "dsp", "bsb", "dec" or "ovl".
@@ -1853,31 +1864,42 @@ func reserveSliceCommand(ownerUUID string, bytes uint64, windowID, intent string
 }
 
 // parseCameraGrant reads the camera verdict of a reserve reply: camera=0|1 and, with camera=1,
-// the sizes of the windows attached. Decode and overlay come only with Cavalry index 0.
-func parseCameraGrant(resp string, index uint32) ([]cameraWindow, error) {
+// the sizes of the windows attached, and the IAV role of the ticket (role=primary|consumer). The
+// server decides the role by ticket, so the grant is the authority on which guest gets decode and
+// overlay; a grant that gives them to a consumer is refused. A server that sends no role is taken
+// at its word. Returns the windows in emission order and the role ("" when the server sent none).
+func parseCameraGrant(resp string) ([]cameraWindow, string, error) {
 	fields := strings.Fields(resp)
 	if len(fields) == 0 || fields[0] != "OK" {
-		return nil, fmt.Errorf("%s", strings.TrimSpace(resp))
+		return nil, "", fmt.Errorf("%s", strings.TrimSpace(resp))
 	}
 	seen := map[string]bool{}
 	sizes := map[string]uint64{}
+	role := ""
 	for _, field := range fields[1:] {
 		key, val, ok := strings.Cut(field, "=")
 		if !ok {
 			continue
 		}
 		switch key {
-		case "camera", "dsp", "bsb", "dec", "ovl":
+		case "camera", "dsp", "bsb", "dec", "ovl", "role":
 		default:
 			continue
 		}
 		if seen[key] {
-			return nil, fmt.Errorf("duplicate %s in slice grant %q", key, strings.TrimSpace(resp))
+			return nil, "", fmt.Errorf("duplicate %s in slice grant %q", key, strings.TrimSpace(resp))
 		}
 		seen[key] = true
+		if key == "role" {
+			if val != "primary" && val != "consumer" {
+				return nil, "", fmt.Errorf("role=%q in slice grant %q", val, strings.TrimSpace(resp))
+			}
+			role = val
+			continue
+		}
 		if key == "camera" {
 			if val != "0" && val != "1" {
-				return nil, fmt.Errorf("camera=%q in slice grant %q", val, strings.TrimSpace(resp))
+				return nil, "", fmt.Errorf("camera=%q in slice grant %q", val, strings.TrimSpace(resp))
 			}
 			if val == "1" {
 				sizes[key] = 1
@@ -1886,31 +1908,31 @@ func parseCameraGrant(resp string, index uint32) ([]cameraWindow, error) {
 		}
 		n, err := strconv.ParseUint(val, 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("%s=%q in slice grant: %w", key, val, err)
+			return nil, "", fmt.Errorf("%s=%q in slice grant: %w", key, val, err)
 		}
 		if n < ivshmemMinSize || n > ivshmemMaxSize || n&(n-1) != 0 {
-			return nil, fmt.Errorf("%s size %d in slice grant is not a power of two between %d and %d",
+			return nil, "", fmt.Errorf("%s size %d in slice grant is not a power of two between %d and %d",
 				key, n, ivshmemMinSize, ivshmemMaxSize)
 		}
 		sizes[key] = n
 	}
 	if !seen["camera"] {
-		return nil, fmt.Errorf("slice grant %q has no camera verdict", strings.TrimSpace(resp))
+		return nil, "", fmt.Errorf("slice grant %q has no camera verdict", strings.TrimSpace(resp))
 	}
 	if sizes["camera"] == 0 {
 		for _, key := range []string{"dsp", "bsb", "dec", "ovl"} {
 			if seen[key] {
-				return nil, fmt.Errorf("slice grant %q has %s without the camera", strings.TrimSpace(resp), key)
+				return nil, "", fmt.Errorf("slice grant %q has %s without the camera", strings.TrimSpace(resp), key)
 			}
 		}
-		return nil, nil
+		return nil, role, nil
 	}
 	if !seen["dsp"] || !seen["bsb"] {
-		return nil, fmt.Errorf("slice grant %q attaches the camera without both dsp and bsb",
+		return nil, "", fmt.Errorf("slice grant %q attaches the camera without both dsp and bsb",
 			strings.TrimSpace(resp))
 	}
-	if index != 0 && (seen["dec"] || seen["ovl"]) {
-		return nil, fmt.Errorf("slice grant %q gives decode or overlay to index %d", strings.TrimSpace(resp), index)
+	if role == "consumer" && (seen["dec"] || seen["ovl"]) {
+		return nil, "", fmt.Errorf("slice grant %q gives decode or overlay to a consumer", strings.TrimSpace(resp))
 	}
 	var windows []cameraWindow
 	for _, w := range cameraWindowOrder {
@@ -1918,7 +1940,47 @@ func parseCameraGrant(resp string, index uint32) ([]cameraWindow, error) {
 			windows = append(windows, cameraWindow{Key: w.key, Size: sizes[w.key]})
 		}
 	}
-	return windows, nil
+	return windows, role, nil
+}
+
+// parseAuxGrant reads the aux aperture of a reserve reply: aux=<size>, at most once, a power of two
+// in the ivshmem bounds, only with the camera and never for a consumer (the aperture carries the
+// primary's partitions). A server that sends none attaches none; an older one never sends it.
+func parseAuxGrant(resp, role string) (uint64, error) {
+	var size uint64
+	seen, camera := false, false
+	for _, field := range strings.Fields(resp) {
+		key, val, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		if key == "camera" && val == "1" {
+			camera = true
+		}
+		if key != "aux" {
+			continue
+		}
+		if seen {
+			return 0, fmt.Errorf("duplicate aux in slice grant %q", strings.TrimSpace(resp))
+		}
+		seen = true
+		n, err := strconv.ParseUint(val, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("aux=%q in slice grant: %w", val, err)
+		}
+		if n < ivshmemMinSize || n > ivshmemMaxSize || n&(n-1) != 0 {
+			return 0, fmt.Errorf("aux size %d in slice grant is not a power of two between %d and %d",
+				n, ivshmemMinSize, ivshmemMaxSize)
+		}
+		size = n
+	}
+	if seen && !camera {
+		return 0, fmt.Errorf("slice grant %q has aux without the camera", strings.TrimSpace(resp))
+	}
+	if seen && role == "consumer" {
+		return 0, fmt.Errorf("slice grant %q gives the aux aperture to a consumer", strings.TrimSpace(resp))
+	}
+	return size, nil
 }
 
 func reserveSliceLease(ownerUUID string, bytes uint64, windowID, intent string) (*shmLeaseInfo, error) {
@@ -1934,7 +1996,11 @@ func reserveSliceLease(ownerUUID string, bytes uint64, windowID, intent string) 
 	if err != nil {
 		return nil, fmt.Errorf("slice reserve: %w", err)
 	}
-	info.Camera, err = parseCameraGrant(resp, info.Index)
+	info.Camera, info.Role, err = parseCameraGrant(resp)
+	if err != nil {
+		return nil, fmt.Errorf("slice reserve: %w", err)
+	}
+	info.Aux, err = parseAuxGrant(resp, info.Role)
 	if err != nil {
 		return nil, fmt.Errorf("slice reserve: %w", err)
 	}
@@ -1956,6 +2022,14 @@ func cameraWindowsFromGrant(grant *shmLeaseInfo) []ivshmemWindow {
 				size:    cw.Size,
 			})
 		}
+	}
+	// The aux aperture: one node per Cavalry lease index, composed by the server for this lease.
+	if grant.Aux != 0 {
+		windows = append(windows, ivshmemWindow{
+			id:      auxWindowID,
+			memPath: auxWindowPath(grant.Index),
+			size:    grant.Aux,
+		})
 	}
 	return windows
 }
