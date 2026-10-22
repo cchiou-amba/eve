@@ -187,6 +187,16 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
   chardev = "charlistener"
   mode = "control"
 
+[chardev "charinput"]
+  backend = "socket"
+  path = "/run/hypervisor/kvm/`+DefaultDomainName+`/input.qmp"
+  server = "on"
+  wait = "off"
+
+[mon "input"]
+  chardev = "charinput"
+  mode = "control"
+
 [memory]
   size = "10240"
 
@@ -458,6 +468,16 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
   chardev = "charlistener"
   mode = "control"
 
+[chardev "charinput"]
+  backend = "socket"
+  path = "/run/hypervisor/kvm/`+DefaultDomainName+`/input.qmp"
+  server = "on"
+  wait = "off"
+
+[mon "input"]
+  chardev = "charinput"
+  mode = "control"
+
 [memory]
   size = "10240"
 
@@ -694,6 +714,16 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
   chardev = "charlistener"
   mode = "control"
 
+[chardev "charinput"]
+  backend = "socket"
+  path = "/run/hypervisor/kvm/`+DefaultDomainName+`/input.qmp"
+  server = "on"
+  wait = "off"
+
+[mon "input"]
+  chardev = "charinput"
+  mode = "control"
+
 [memory]
   size = "10240"
 
@@ -746,6 +776,11 @@ func TestCreateDomConfigOnlyCom1(t *testing.T) {
   driver = "usb-mouse"
   bus = "usb.0"
   port = "2"
+
+[device "input2"]
+  driver = "usb-tablet"
+  bus = "usb.0"
+  port = "3"
 
 
 [device "pci.4"]
@@ -1304,6 +1339,16 @@ func domConfigArm64() string {
   chardev = "charlistener"
   mode = "control"
 
+[chardev "charinput"]
+  backend = "socket"
+  path = "/run/hypervisor/kvm/`+DefaultDomainName+`/input.qmp"
+  server = "on"
+  wait = "off"
+
+[mon "input"]
+  chardev = "charinput"
+  mode = "control"
+
 [memory]
   size = "10240"
 
@@ -1364,6 +1409,11 @@ func domConfigArm64() string {
   driver = "usb-mouse"
   bus = "usb.0"
   port = "2"
+
+[device "input2"]
+  driver = "usb-tablet"
+  bus = "usb.0"
+  port = "3"
 
 
 [device "pci.4"]
@@ -1608,6 +1658,16 @@ func domConfigAmd64FML() string {
 
 [mon "listener"]
   chardev = "charlistener"
+  mode = "control"
+
+[chardev "charinput"]
+  backend = "socket"
+  path = "/run/hypervisor/kvm/`+DefaultDomainName+`/input.qmp"
+  server = "on"
+  wait = "off"
+
+[mon "input"]
+  chardev = "charinput"
   mode = "control"
 
 [memory]
@@ -1902,6 +1962,16 @@ func domConfigAmd64Legacy() string {
   chardev = "charlistener"
   mode = "control"
 
+[chardev "charinput"]
+  backend = "socket"
+  path = "/run/hypervisor/kvm/`+DefaultDomainName+`/input.qmp"
+  server = "on"
+  wait = "off"
+
+[mon "input"]
+  chardev = "charinput"
+  mode = "control"
+
 [memory]
   size = "10240"
 
@@ -2182,6 +2252,16 @@ func domConfigAmd64() string {
   chardev = "charlistener"
   mode = "control"
 
+[chardev "charinput"]
+  backend = "socket"
+  path = "/run/hypervisor/kvm/`+DefaultDomainName+`/input.qmp"
+  server = "on"
+  wait = "off"
+
+[mon "input"]
+  chardev = "charinput"
+  mode = "control"
+
 [memory]
   size = "10240"
 
@@ -2458,6 +2538,16 @@ func domConfigContainerVNC() string {
 
 [mon "listener"]
   chardev = "charlistener"
+  mode = "control"
+
+[chardev "charinput"]
+  backend = "socket"
+  path = "/run/hypervisor/kvm/`+DefaultDomainName+`/input.qmp"
+  server = "on"
+  wait = "off"
+
+[mon "input"]
+  chardev = "charinput"
   mode = "control"
 
 [memory]
