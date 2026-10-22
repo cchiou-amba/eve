@@ -4447,3 +4447,99 @@ func TestUartVfioStopWithQmpSocketDefersReleaseUntilSocketGone(t *testing.T) {
 		t.Fatalf("expected ambarella-uart after QMP socket is gone, got %q", got)
 	}
 }
+
+func TestPCIAssignmentsMultiDomainAndDmaShm(t *testing.T) {
+	tmpDir := t.TempDir()
+	fakeNvmeDma := filepath.Join(tmpDir, "amba_virt_nvme_dma")
+	fakeNicDma := filepath.Join(tmpDir, "amba_virt_nic_dma")
+	if err := os.WriteFile(fakeNvmeDma, []byte{}, 0600); err != nil {
+		t.Fatalf("failed to create fake nvme dma node: %v", err)
+	}
+	if err := os.WriteFile(fakeNicDma, []byte{}, 0600); err != nil {
+		t.Fatalf("failed to create fake nic dma node: %v", err)
+	}
+
+	origNvmePath := nvmeDmaDevPath
+	origNicPath := nicDmaDevPath
+	nvmeDmaDevPath = fakeNvmeDma
+	nicDmaDevPath = fakeNicDma
+	defer func() {
+		nvmeDmaDevPath = origNvmePath
+		nicDmaDevPath = origNicPath
+	}()
+
+	id, err := uuid.NewV4()
+	if err != nil {
+		t.Fatalf("NewV4 failed: %v", err)
+	}
+	config := types.DomainConfig{
+		UUIDandVersion: types.UUIDandVersion{UUID: id, Version: "1.0"},
+		VmConfig: types.VmConfig{
+			VirtualizationMode: types.HVM,
+			BootLoader:         "/usr/lib/xen/boot/ovmf.bin",
+			Memory:             1024 * 1024 * 4,
+			VCpus:              2,
+		},
+		IoAdapterList: []types.IoAdapter{
+			{Type: types.IoNVME, Name: "NVME0"},
+			{Type: types.IoNetEth, Name: "eth1"},
+		},
+	}
+	aa := types.AssignableAdapters{
+		Initialized: true,
+		IoBundleList: []types.IoBundle{
+			{
+				Type:            types.IoNVME,
+				AssignmentGroup: "NVME0",
+				Phylabel:        "NVME0",
+				Ifname:          "0000:01:00.0",
+				PciLong:         "0000:01:00.0",
+				UsedByUUID:      id,
+			},
+			{
+				Type:            types.IoNetEth,
+				AssignmentGroup: "eth1",
+				Phylabel:        "eth1",
+				Ifname:          "eth1",
+				PciLong:         "0001:01:00.0",
+				UsedByUUID:      id,
+			},
+		},
+	}
+
+	conf, err := os.CreateTemp(tmpDir, "qemu-pcie-conf")
+	if err != nil {
+		t.Fatalf("CreateTemp failed: %v", err)
+	}
+	defer conf.Close()
+
+	if err := kvmArm.CreateDomConfig(DefaultDomainName, config, types.DomainStatus{},
+		nil, &aa, nil, swtpmCtrlSock, conf); err != nil {
+		t.Fatalf("CreateDomConfig failed: %v", err)
+	}
+
+	raw, err := os.ReadFile(conf.Name())
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	out := string(raw)
+
+	// Domain 0000 endpoint uses short BDF ("01:00.0"); domain 0001 endpoint preserves full BDF ("0001:01:00.0").
+	if !strings.Contains(out, `host = "01:00.0"`) {
+		t.Errorf("expected domain 0000 endpoint to render host = \"01:00.0\", got:\n%s", out)
+	}
+	if !strings.Contains(out, `host = "0001:01:00.0"`) {
+		t.Errorf("expected domain 0001 endpoint to preserve full BDF host = \"0001:01:00.0\", got:\n%s", out)
+	}
+
+	// Both 64 MiB ivshmem-plain DMA carveout stanzas must be rendered.
+	if !strings.Contains(out, `[object "amba-virt-nvme-dma-shm"]`) ||
+		!strings.Contains(out, fmt.Sprintf(`mem-path = "%s"`, fakeNvmeDma)) ||
+		!strings.Contains(out, `size = "67108864"`) {
+		t.Errorf("expected 64 MiB amba-virt-nvme-dma-shm ivshmem stanza, got:\n%s", out)
+	}
+	if !strings.Contains(out, `[object "amba-virt-nic-dma-shm"]`) ||
+		!strings.Contains(out, fmt.Sprintf(`mem-path = "%s"`, fakeNicDma)) {
+		t.Errorf("expected 64 MiB amba-virt-nic-dma-shm ivshmem stanza, got:\n%s", out)
+	}
+}

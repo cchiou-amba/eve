@@ -745,6 +745,9 @@ type tQemuIvshmemContext struct {
 	ReadOnly bool
 }
 
+var nvmeDmaDevPath = "/dev/amba_virt_nvme_dma"
+var nicDmaDevPath = "/dev/amba_virt_nic_dma"
+
 // Context for qemuIvshmemVoutFbTemplate.
 type tQemuIvshmemVoutFbContext struct {
 	MemPath string
@@ -3038,8 +3041,12 @@ func (f *pciAssignmentsTemplateFiller) do(pciAssignments []pciDevice) error {
 
 	pciEBridgeForMultiFuncDevCreated := make(map[string]struct{}) // key: pci long without function number
 	for _, pa := range pciAssignments {
+		pciHostAddr := types.PCILongToShort(pa.ioBundle.PciLong)
+		if pa.ioBundle.PciLong != "" && !strings.HasPrefix(pa.ioBundle.PciLong, "0000:") {
+			pciHostAddr = pa.ioBundle.PciLong
+		}
 		pciPTContext := tQemuPCIPassthruContext{
-			PciShortAddr: types.PCILongToShort(pa.ioBundle.PciLong),
+			PciShortAddr: pciHostAddr,
 			Xvga:         pa.isVGA(),
 			Xopregion:    false,
 		}
@@ -3810,6 +3817,48 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 		if err = tQemuIvshmem.Execute(tmpFile, usbDmaContext); err != nil {
 			return logError("can't write USB DMA ivshmem assignment to config file %s (%v)",
 				tmpFile.Name(), err)
+		}
+	}
+
+	if len(pciAssignments) > 0 {
+		hasPcie0 := false
+		hasPcie1 := false
+		for _, pa := range pciAssignments {
+			if strings.HasPrefix(pa.ioBundle.PciLong, "0000:") {
+				hasPcie0 = true
+			} else if strings.HasPrefix(pa.ioBundle.PciLong, "0001:") {
+				hasPcie1 = true
+			}
+		}
+		if hasPcie0 {
+			if _, statErr := os.Stat(nvmeDmaDevPath); statErr == nil {
+				logrus.Infof("Adding NVMe PCIe0 DMA carveout backed by %s (64 MiB)", nvmeDmaDevPath)
+				nvmeDmaContext := tQemuIvshmemContext{
+					ID:       "amba-virt-nvme-dma-shm",
+					MemPath:  nvmeDmaDevPath,
+					Size:     64 << 20,
+					ReadOnly: false,
+				}
+				if err = tQemuIvshmem.Execute(tmpFile, nvmeDmaContext); err != nil {
+					return logError("can't write NVMe DMA ivshmem assignment to config file %s (%v)",
+						tmpFile.Name(), err)
+				}
+			}
+		}
+		if hasPcie1 {
+			if _, statErr := os.Stat(nicDmaDevPath); statErr == nil {
+				logrus.Infof("Adding NIC PCIe1 DMA carveout backed by %s (64 MiB)", nicDmaDevPath)
+				nicDmaContext := tQemuIvshmemContext{
+					ID:       "amba-virt-nic-dma-shm",
+					MemPath:  nicDmaDevPath,
+					Size:     64 << 20,
+					ReadOnly: false,
+				}
+				if err = tQemuIvshmem.Execute(tmpFile, nicDmaContext); err != nil {
+					return logError("can't write NIC DMA ivshmem assignment to config file %s (%v)",
+						tmpFile.Name(), err)
+				}
+			}
 		}
 	}
 
