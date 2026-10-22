@@ -3821,6 +3821,7 @@ type fakePlatformSysfs struct {
 	devicesDir        string
 	driversDir        string
 	ambarellaDrvDir   string
+	sdhciDrvDir       string
 	vfioDrvDir        string
 	driversProbeFile  string
 	unbindCalls       map[string]int
@@ -3838,11 +3839,12 @@ func setupFakePlatformSysfs(t *testing.T) *fakePlatformSysfs {
 	devicesDir := filepath.Join(root, "devices")
 	driversDir := filepath.Join(root, "drivers")
 	ambarellaDrvDir := filepath.Join(driversDir, "ambarella-uart")
+	sdhciDrvDir := filepath.Join(driversDir, "sdhci-ambarella")
 	vfioDrvDir := filepath.Join(driversDir, "vfio-platform")
 	driversProbeFile := filepath.Join(root, "drivers_probe")
 	stateDirRoot := filepath.Join(root, "state")
 
-	for _, d := range []string{devicesDir, ambarellaDrvDir, vfioDrvDir, stateDirRoot} {
+	for _, d := range []string{devicesDir, ambarellaDrvDir, sdhciDrvDir, vfioDrvDir, stateDirRoot} {
 		if err := os.MkdirAll(d, 0755); err != nil {
 			t.Fatalf("mkdir %s: %v", d, err)
 		}
@@ -3850,6 +3852,8 @@ func setupFakePlatformSysfs(t *testing.T) *fakePlatformSysfs {
 	for _, f := range []string{
 		filepath.Join(ambarellaDrvDir, "bind"),
 		filepath.Join(ambarellaDrvDir, "unbind"),
+		filepath.Join(sdhciDrvDir, "bind"),
+		filepath.Join(sdhciDrvDir, "unbind"),
 		filepath.Join(vfioDrvDir, "bind"),
 		filepath.Join(vfioDrvDir, "unbind"),
 		driversProbeFile,
@@ -3864,12 +3868,18 @@ func setupFakePlatformSysfs(t *testing.T) *fakePlatformSysfs {
 		t.Fatalf("write %s: %v", fakeCtl, err)
 	}
 
+	fakeSdioDma := filepath.Join(root, "amba_virt_sdio_dma")
+	if err := os.WriteFile(fakeSdioDma, nil, 0644); err != nil {
+		t.Fatalf("write %s: %v", fakeSdioDma, err)
+	}
+
 	fs := &fakePlatformSysfs{
 		t:                 t,
 		root:              root,
 		devicesDir:        devicesDir,
 		driversDir:        driversDir,
 		ambarellaDrvDir:   ambarellaDrvDir,
+		sdhciDrvDir:       sdhciDrvDir,
 		vfioDrvDir:        vfioDrvDir,
 		driversProbeFile:  driversProbeFile,
 		unbindCalls:       make(map[string]int),
@@ -3885,6 +3895,7 @@ func setupFakePlatformSysfs(t *testing.T) *fakePlatformSysfs {
 	origMockBind := allowMockPlatformBind
 	origMockLease := allowMockDmaLease
 	origCtl := ambaDmaCtlDev
+	origSdioDma := sdioDmaDevPath
 	origLeasePathFunc := ambaDmaLeasePathFunc
 	origAllocFunc := ambaDmaIoctlAllocFunc
 	origCtrlFunc := ambaDmaIoctlCtrlFunc
@@ -3897,6 +3908,7 @@ func setupFakePlatformSysfs(t *testing.T) *fakePlatformSysfs {
 	allowMockPlatformBind = false
 	allowMockDmaLease = false
 	ambaDmaCtlDev = fakeCtl
+	sdioDmaDevPath = fakeSdioDma
 	domainStateDir = func(domainName string) string {
 		return filepath.Join(stateDirRoot, domainName)
 	}
@@ -3963,6 +3975,9 @@ func setupFakePlatformSysfs(t *testing.T) *fakePlatformSysfs {
 				return os.Symlink(vfioDrvDir, driverLink)
 			}
 			_ = os.Remove(driverLink)
+			if strings.HasSuffix(hostDev, ".sdmmc1") || strings.HasSuffix(hostDev, ".sdmmc0") {
+				return os.Symlink(sdhciDrvDir, driverLink)
+			}
 			return os.Symlink(ambarellaDrvDir, driverLink)
 		}
 		return os.WriteFile(path, data, 0644)
@@ -3972,6 +3987,8 @@ func setupFakePlatformSysfs(t *testing.T) *fakePlatformSysfs {
 	domainLeases = make(map[string]*domainDmaLeaseInfo)
 	domainUartOwners = make(map[string]string)
 	domainUartState = make(map[string]*domainUartReservation)
+	domainSdioOwners = make(map[string]string)
+	domainSdioState = make(map[string]*domainSdioReservation)
 	domainLeaseLock.Unlock()
 
 	t.Cleanup(func() {
@@ -3982,6 +3999,7 @@ func setupFakePlatformSysfs(t *testing.T) *fakePlatformSysfs {
 		allowMockPlatformBind = origMockBind
 		allowMockDmaLease = origMockLease
 		ambaDmaCtlDev = origCtl
+		sdioDmaDevPath = origSdioDma
 		ambaDmaLeasePathFunc = origLeasePathFunc
 		ambaDmaIoctlAllocFunc = origAllocFunc
 		ambaDmaIoctlCtrlFunc = origCtrlFunc
@@ -3991,6 +4009,8 @@ func setupFakePlatformSysfs(t *testing.T) *fakePlatformSysfs {
 		domainLeases = make(map[string]*domainDmaLeaseInfo)
 		domainUartOwners = make(map[string]string)
 		domainUartState = make(map[string]*domainUartReservation)
+		domainSdioOwners = make(map[string]string)
+		domainSdioState = make(map[string]*domainSdioReservation)
 		domainLeaseLock.Unlock()
 	})
 
@@ -4544,5 +4564,298 @@ func TestPCIAssignmentsMultiDomainAndDmaShm(t *testing.T) {
 	if !strings.Contains(out, `[object "amba-virt-nic-dma-shm"]`) ||
 		!strings.Contains(out, fmt.Sprintf(`mem-path = "%s"`, fakeNicDma)) {
 		t.Errorf("expected 64 MiB amba-virt-nic-dma-shm ivshmem stanza, got:\n%s", out)
+	}
+}
+
+func TestAmbaMultiUartOrderingAndSingleDmaLease(t *testing.T) {
+	fs := setupFakePlatformSysfs(t)
+	fs.addDevice("ffe0017000.uart", "ambarella-uart")
+	fs.addDevice("ffe0018000.uart", "ambarella-uart")
+
+	diskConfigs, diskStatuses := qemuDisks()
+	config, aa := domainConfigAndAssignableAdapters(diskConfigs)
+	id, err := uuid.FromString(DefaultUUID)
+	if err != nil {
+		t.Fatalf("bad uuid: %v", err)
+	}
+	config.UUIDandVersion.UUID = id
+	config.VirtualizationMode = types.HVM
+	for i := range aa.IoBundleList {
+		aa.IoBundleList[i].UsedByUUID = id
+	}
+	// Add UART1 first, then UART2 in config / aa to test that sorting correctly reorders them.
+	config.IoAdapterList = append(config.IoAdapterList,
+		types.IoAdapter{Type: types.IoOther, Name: "uart1"},
+		types.IoAdapter{Type: types.IoOther, Name: "uart2"},
+	)
+	aa.IoBundleList = append(aa.IoBundleList,
+		types.IoBundle{
+			Type:            types.IoOther,
+			AssignmentGroup: "uart1",
+			Phylabel:        "uart1",
+			Logicallabel:    "uart1",
+			Cbattr:          map[string]string{"uart": "1"},
+			UsedByUUID:      id,
+		},
+		types.IoBundle{
+			Type:            types.IoOther,
+			AssignmentGroup: "uart2",
+			Phylabel:        "uart2",
+			Logicallabel:    "uart2",
+			Cbattr:          map[string]string{"uart": "2"},
+			UsedByUUID:      id,
+		},
+	)
+
+	domName := DefaultUUID + ".0.0"
+	conf, err := os.CreateTemp(t.TempDir(), "conf")
+	if err != nil {
+		t.Fatalf("CreateTemp failed: %v", err)
+	}
+	defer conf.Close()
+
+	if err := kvmArm.CreateDomConfig(domName, config, types.DomainStatus{}, diskStatuses, &aa, nil, swtpmCtrlSock, conf); err != nil {
+		t.Fatalf("CreateDomConfig failed: %v", err)
+	}
+
+	raw, err := os.ReadFile(conf.Name())
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	out := string(raw)
+
+	// Verify both devices bound to vfio-platform
+	if got := fs.boundDriver("ffe0017000.uart"); got != "vfio-platform" {
+		t.Fatalf("expected ffe0017000.uart bound to vfio-platform, got %q", got)
+	}
+	if got := fs.boundDriver("ffe0018000.uart"); got != "vfio-platform" {
+		t.Fatalf("expected ffe0018000.uart bound to vfio-platform, got %q", got)
+	}
+
+	// Verify ordering: ffe0018000.uart (UART2 / console) appears before ffe0017000.uart (UART1 / BT HCI)
+	idxUart2 := strings.Index(out, `host = "ffe0018000.uart"`)
+	idxUart1 := strings.Index(out, `host = "ffe0017000.uart"`)
+	if idxUart2 == -1 || idxUart1 == -1 {
+		t.Fatalf("expected both UARTs in qemu config, got:\n%s", out)
+	}
+	if idxUart2 > idxUart1 {
+		t.Fatalf("expected console UART2 (ffe0018000.uart) to appear before UART1 (ffe0017000.uart)")
+	}
+
+	// Verify allocated EndpointID is 2 (console UART) and lease alloc was requested
+	if len(fs.allocRequests) != 1 {
+		t.Fatalf("expected exactly 1 DMA lease alloc request for multi-UART domain, got %d", len(fs.allocRequests))
+	}
+	if fs.allocRequests[0].EndpointID != 2 {
+		t.Fatalf("expected allocated EndpointID == 2, got %d", fs.allocRequests[0].EndpointID)
+	}
+
+	// Verify dma32-lease is emitted exactly once
+	if strings.Count(out, `[object "dma32-lease`) != 1 {
+		t.Fatalf("expected exactly 1 dma32-lease object in config, got:\n%s", out)
+	}
+
+	// Clean up / Stop
+	if err := kvmArm.Stop(domName, false); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+	if got := fs.boundDriver("ffe0017000.uart"); got != "ambarella-uart" {
+		t.Fatalf("expected ffe0017000.uart restored to ambarella-uart, got %q", got)
+	}
+	if got := fs.boundDriver("ffe0018000.uart"); got != "ambarella-uart" {
+		t.Fatalf("expected ffe0018000.uart restored to ambarella-uart, got %q", got)
+	}
+}
+
+func TestAmbaWifiSdioLifecycleAndCarveout(t *testing.T) {
+	fs := setupFakePlatformSysfs(t)
+	fs.addDevice("fff2001000.sdmmc1", "sdhci-ambarella")
+
+	diskConfigs, diskStatuses := qemuDisks()
+	config, aa := domainConfigAndAssignableAdapters(diskConfigs)
+	id, err := uuid.FromString(DefaultUUID)
+	if err != nil {
+		t.Fatalf("bad uuid: %v", err)
+	}
+	config.UUIDandVersion.UUID = id
+	config.VirtualizationMode = types.HVM
+	for i := range aa.IoBundleList {
+		aa.IoBundleList[i].UsedByUUID = id
+	}
+	config.IoAdapterList = append(config.IoAdapterList, types.IoAdapter{
+		Type: types.IoOther,
+		Name: "WIFI_SDIO",
+	})
+	aa.IoBundleList = append(aa.IoBundleList, types.IoBundle{
+		Type:            types.IoOther,
+		AssignmentGroup: "wifi_sdio",
+		Phylabel:        "WIFI_SDIO",
+		Logicallabel:    "WIFI_SDIO",
+		Cbattr:          map[string]string{"sdio": "1"},
+		UsedByUUID:      id,
+	})
+
+	domName := DefaultUUID + ".0.0"
+	conf, err := os.CreateTemp(t.TempDir(), "conf")
+	if err != nil {
+		t.Fatalf("CreateTemp failed: %v", err)
+	}
+	defer conf.Close()
+
+	if err := kvmArm.CreateDomConfig(domName, config, types.DomainStatus{}, diskStatuses, &aa, nil, swtpmCtrlSock, conf); err != nil {
+		t.Fatalf("CreateDomConfig failed: %v", err)
+	}
+
+	raw, err := os.ReadFile(conf.Name())
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	out := string(raw)
+
+	// Verify fff2001000.sdmmc1 bound to vfio-platform
+	if got := fs.boundDriver("fff2001000.sdmmc1"); got != "vfio-platform" {
+		t.Fatalf("expected fff2001000.sdmmc1 bound to vfio-platform, got %q", got)
+	}
+
+	// Verify vfio-platform host device is emitted
+	if !strings.Contains(out, `host = "fff2001000.sdmmc1"`) {
+		t.Fatalf("expected host = \"fff2001000.sdmmc1\" in qemu config, got:\n%s", out)
+	}
+
+	// Verify 16 MiB amba-virt-sdio-dma-shm ivshmem stanza is emitted
+	if !strings.Contains(out, `[object "amba-virt-sdio-dma-shm"]`) ||
+		!strings.Contains(out, `size = "16777216"`) {
+		t.Fatalf("expected 16 MiB amba-virt-sdio-dma-shm in qemu config, got:\n%s", out)
+	}
+
+	// Verify Stop restores sdhci-ambarella host driver
+	if err := kvmArm.Stop(domName, false); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+	if got := fs.boundDriver("fff2001000.sdmmc1"); got != "sdhci-ambarella" {
+		t.Fatalf("expected fff2001000.sdmmc1 restored to sdhci-ambarella, got %q", got)
+	}
+}
+
+func TestAmbaWifiSdioAndUartCoexistence(t *testing.T) {
+	fs := setupFakePlatformSysfs(t)
+	fs.addDevice("fff2001000.sdmmc1", "sdhci-ambarella")
+	fs.addDevice("ffe0018000.uart", "ambarella-uart")
+
+	diskConfigs, diskStatuses := qemuDisks()
+	config, aa := domainConfigAndAssignableAdapters(diskConfigs)
+	id, err := uuid.FromString(DefaultUUID)
+	if err != nil {
+		t.Fatalf("bad uuid: %v", err)
+	}
+	config.UUIDandVersion.UUID = id
+	config.VirtualizationMode = types.HVM
+	for i := range aa.IoBundleList {
+		aa.IoBundleList[i].UsedByUUID = id
+	}
+	config.IoAdapterList = append(config.IoAdapterList,
+		types.IoAdapter{Type: types.IoOther, Name: "UART2"},
+		types.IoAdapter{Type: types.IoOther, Name: "WIFI_SDIO"},
+	)
+	aa.IoBundleList = append(aa.IoBundleList,
+		types.IoBundle{
+			Type:            types.IoOther,
+			AssignmentGroup: "uart2",
+			Phylabel:        "UART2",
+			Logicallabel:    "UART2",
+			Cbattr:          map[string]string{"uart": "2"},
+			UsedByUUID:      id,
+		},
+		types.IoBundle{
+			Type:            types.IoOther,
+			AssignmentGroup: "wifi_sdio",
+			Phylabel:        "WIFI_SDIO",
+			Logicallabel:    "WIFI_SDIO",
+			Cbattr:          map[string]string{"sdio": "1"},
+			UsedByUUID:      id,
+		},
+	)
+
+	domName := DefaultUUID + ".0.0"
+	conf, err := os.CreateTemp(t.TempDir(), "conf")
+	if err != nil {
+		t.Fatalf("CreateTemp failed: %v", err)
+	}
+	defer conf.Close()
+
+	if err := kvmArm.CreateDomConfig(domName, config, types.DomainStatus{}, diskStatuses, &aa, nil, swtpmCtrlSock, conf); err != nil {
+		t.Fatalf("CreateDomConfig failed: %v", err)
+	}
+
+	raw, err := os.ReadFile(conf.Name())
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	out := string(raw)
+
+	if !strings.Contains(out, `host = "ffe0018000.uart"`) {
+		t.Fatalf("expected host = \"ffe0018000.uart\" in qemu config, got:\n%s", out)
+	}
+	if !strings.Contains(out, `host = "fff2001000.sdmmc1"`) {
+		t.Fatalf("expected host = \"fff2001000.sdmmc1\" in qemu config, got:\n%s", out)
+	}
+	if !strings.Contains(out, `[object "amba-virt-sdio-dma-shm"]`) {
+		t.Fatalf("expected amba-virt-sdio-dma-shm in qemu config, got:\n%s", out)
+	}
+
+	lease := loadDomainLease(domName)
+	if lease == nil {
+		t.Fatalf("expected dma lease saved for %s", domName)
+	}
+	if len(lease.SdioDevs) == 0 || lease.SdioDevs[0] != "fff2001000.sdmmc1" {
+		t.Fatalf("expected sdio_devs to contain fff2001000.sdmmc1, got: %+v", lease.SdioDevs)
+	}
+
+	if err := kvmArm.Stop(domName, false); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+}
+
+func TestAmbaSdioRejectsEmmc0(t *testing.T) {
+	fs := setupFakePlatformSysfs(t)
+	fs.addDevice("fff2000000.sdmmc0", "sdhci-ambarella")
+
+	diskConfigs, diskStatuses := qemuDisks()
+	config, aa := domainConfigAndAssignableAdapters(diskConfigs)
+	id, err := uuid.FromString(DefaultUUID)
+	if err != nil {
+		t.Fatalf("bad uuid: %v", err)
+	}
+	config.UUIDandVersion.UUID = id
+	config.VirtualizationMode = types.HVM
+	for i := range aa.IoBundleList {
+		aa.IoBundleList[i].UsedByUUID = id
+	}
+	config.IoAdapterList = append(config.IoAdapterList, types.IoAdapter{
+		Type: types.IoOther,
+		Name: "EMMC0",
+	})
+	aa.IoBundleList = append(aa.IoBundleList, types.IoBundle{
+		Type:            types.IoOther,
+		AssignmentGroup: "emmc0",
+		Phylabel:        "EMMC0",
+		Logicallabel:    "EMMC0",
+		Cbattr:          map[string]string{"sdio": "0"},
+		UsedByUUID:      id,
+	})
+
+	domName := DefaultUUID + ".0.0"
+	conf, err := os.CreateTemp(t.TempDir(), "conf")
+	if err != nil {
+		t.Fatalf("CreateTemp failed: %v", err)
+	}
+	defer conf.Close()
+
+	err = kvmArm.CreateDomConfig(domName, config, types.DomainStatus{}, diskStatuses, &aa, nil, swtpmCtrlSock, conf)
+	if err == nil {
+		t.Fatalf("expected CreateDomConfig to fail when assigning EMMC0 (sdio:0), but it succeeded")
+	}
+	if !strings.Contains(err.Error(), "EMMC0") && !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("expected error mentioning EMMC0 or reserved, got: %v", err)
 	}
 }

@@ -151,7 +151,7 @@ index 4156111d49..a2c254de7d 100644
  #include "sysemu/numa.h"
  #include "sysemu/reset.h"
  #include "sysemu/tpm.h"
-@@ -93,6 +94,217 @@ static void acpi_dsdt_add_uart(Aml *scope, const MemMapEntry *uart_memmap,
+@@ -93,6 +94,294 @@ static void acpi_dsdt_add_uart(Aml *scope, const MemMapEntry *uart_memmap,
      aml_append(scope, dev);
  }
  
@@ -161,6 +161,7 @@ index 4156111d49..a2c254de7d 100644
 +    PlatformBusDevice *pbus;
 +    uint32_t uart_count;
 +    uint32_t usb_count;
++    uint32_t sdhci_count;
 +} DynamicSysbusAcpiContext;
 +
 +static void acpi_dsdt_add_amba_uart(SysBusDevice *sbdev, void *opaque)
@@ -366,10 +367,86 @@ index 4156111d49..a2c254de7d 100644
 +    ctx->usb_count++;
 +}
 +
++static void acpi_dsdt_add_amba_sdhci(SysBusDevice *sbdev, void *opaque)
++{
++    DynamicSysbusAcpiContext *ctx = opaque;
++    VirtMachineState *vms = ctx->vms;
++    PlatformBusDevice *pbus = ctx->pbus;
++    Aml *scope = ctx->scope;
++    MemoryRegion *mr;
++    hwaddr mmio_offset, absolute_gpa;
++    int irqn;
++    uint32_t intid;
++    char nameseg[5];
++    Aml *dev, *crs;
++
++    if (!vfio_platform_device_has_compatible(sbdev, "ambarella,sdhci")) {
++        return;
++    }
++
++    if (ctx->sdhci_count >= 10) {
++        error_setg(&error_fatal,
++                   "Too many Ambarella SDHCI devices (maximum 10: SDC0-SDC9)");
++        return;
++    }
++
++    /* Require MMIO region 0 to exist */
++    if (sbdev->num_mmio < 1) {
++        error_setg(&error_fatal, "Ambarella SDHCI device has no MMIO regions");
++        return;
++    }
++
++    mr = sysbus_mmio_get_region(sbdev, 0);
++    if (!mr || memory_region_size(mr) != 0x1000) {
++        error_setg(&error_fatal,
++                   "Ambarella SDHCI region size mismatch (want 0x1000, got 0x%" PRIx64 ")",
++                   mr ? (uint64_t)memory_region_size(mr) : 0);
++        return;
++    }
++
++    mmio_offset = platform_bus_get_mmio_addr(pbus, sbdev, 0);
++    if (mmio_offset == (hwaddr)-1) {
++        error_setg(&error_fatal,
++                   "Ambarella SDHCI MMIO region 0 not mapped on platform bus");
++        return;
++    }
++
++    absolute_gpa = vms->memmap[VIRT_PLATFORM_BUS].base + mmio_offset;
++    if (absolute_gpa + 0x1000 > UINT32_MAX) {
++        error_setg(&error_fatal,
++                   "Ambarella SDHCI absolute GPA 0x%" PRIx64 " does not fit in Memory32Fixed",
++                   absolute_gpa);
++        return;
++    }
++
++    irqn = platform_bus_get_irqn(pbus, sbdev, 0);
++    if (irqn < 0) {
++        error_setg(&error_fatal,
++                   "Ambarella SDHCI IRQ 0 not mapped on platform bus");
++        return;
++    }
++
++    intid = ARM_SPI_BASE + vms->irqmap[VIRT_PLATFORM_BUS] + irqn;
++
++    snprintf(nameseg, sizeof(nameseg), "SDC%u", ctx->sdhci_count);
++    dev = aml_device("%s", nameseg);
++    aml_append(dev, aml_name_decl("_HID", aml_string("AMBA0004")));
++    aml_append(dev, aml_name_decl("_UID", aml_int(ctx->sdhci_count)));
++
++    crs = aml_resource_template();
++    aml_append(crs, aml_memory32_fixed((uint32_t)absolute_gpa, 0x1000, AML_READ_WRITE));
++    aml_append(crs, aml_interrupt(AML_CONSUMER, AML_LEVEL, AML_ACTIVE_HIGH,
++                                  AML_EXCLUSIVE, &intid, 1));
++    aml_append(dev, aml_name_decl("_CRS", crs));
++
++    aml_append(scope, dev);
++    ctx->sdhci_count++;
++}
++
  static void acpi_dsdt_add_fw_cfg(Aml *scope, const MemMapEntry *fw_cfg_memmap)
  {
      Aml *dev = aml_device("FWCF");
-@@ -893,6 +1104,18 @@ build_dsdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
+@@ -893,6 +1181,20 @@ build_dsdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
      acpi_dsdt_add_tpm(scope, vms);
  #endif
  
@@ -380,9 +457,11 @@ index 4156111d49..a2c254de7d 100644
 +            .pbus = PLATFORM_BUS_DEVICE(vms->platform_bus_dev),
 +            .uart_count = 0,
 +            .usb_count = 0,
++            .sdhci_count = 0,
 +        };
 +        foreach_dynamic_sysbus_device(acpi_dsdt_add_amba_uart, &ctx);
 +        foreach_dynamic_sysbus_device(acpi_dsdt_add_amba_usb, &ctx);
++        foreach_dynamic_sysbus_device(acpi_dsdt_add_amba_sdhci, &ctx);
 +    }
 +
      aml_append(dsdt, scope);

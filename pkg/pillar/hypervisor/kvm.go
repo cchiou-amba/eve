@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1120,6 +1121,14 @@ func ivshmemWindowFromBundle(ib types.IoBundle) (*ivshmemWindow, error) {
 		return nil, nil
 	}
 
+	sdioAttr := ib.Cbattr[sdioCbattrKey]
+	if sdioAttr == "" {
+		sdioAttr = ib.Cbattr[sdmmcCbattrKey]
+	}
+	if sdioAttr != "" {
+		return nil, nil
+	}
+
 	w := ivshmemWindow{
 		id:      label,
 		memPath: filepath.Join(ivshmemDefaultDir, label),
@@ -1206,6 +1215,14 @@ func uartAdapterFromBundle(ib types.IoBundle) (*uartAdapter, error) {
 		return nil, nil
 	}
 
+	sdioAttr := ib.Cbattr[sdioCbattrKey]
+	if sdioAttr == "" {
+		sdioAttr = ib.Cbattr[sdmmcCbattrKey]
+	}
+	if sdioAttr != "" {
+		return nil, nil
+	}
+
 	if shmPath != "" || shmSize != "" {
 		return nil, logError("uart adapter %s: cannot combine uart attribute with shmpath/shmsize", label)
 	}
@@ -1255,6 +1272,13 @@ func resolveRngTransport(domainName string, aa *types.AssignableAdapters,
 				continue
 			}
 			if ib.Type != types.IoOther {
+				continue
+			}
+			sdioAttr := ib.Cbattr[sdioCbattrKey]
+			if sdioAttr == "" {
+				sdioAttr = ib.Cbattr[sdmmcCbattrKey]
+			}
+			if sdioAttr != "" {
 				continue
 			}
 			rngAttr, hasRng := ib.Cbattr[rngCbattrKey]
@@ -1316,6 +1340,9 @@ func collectUartAdapters(domainName string, aa *types.AssignableAdapters,
 			uarts = append(uarts, *u)
 		}
 	}
+	sort.SliceStable(uarts, func(i, j int) bool {
+		return (uarts[i].uartID == "1") != (uarts[j].uartID == "1") && uarts[i].uartID != "1"
+	})
 	return uarts, nil
 }
 
@@ -1390,9 +1417,16 @@ type domainDmaLeaseInfo struct {
 	Epoch       uint64   `json:"epoch"`
 	Cid         uint32   `json:"cid"`
 	HostDevices []string `json:"host_devices,omitempty"`
+	SdioDevs    []string `json:"sdio_devs,omitempty"`
 }
 
 type domainUartReservation struct {
+	domainUUID  uuid.UUID
+	aa          *types.AssignableAdapters
+	hostDevices []string
+}
+
+type domainSdioReservation struct {
 	domainUUID  uuid.UUID
 	aa          *types.AssignableAdapters
 	hostDevices []string
@@ -1403,7 +1437,233 @@ var (
 	domainLeases     = make(map[string]*domainDmaLeaseInfo)
 	domainUartOwners = make(map[string]string)
 	domainUartState  = make(map[string]*domainUartReservation)
+	domainSdioOwners = make(map[string]string)
+	domainSdioState  = make(map[string]*domainSdioReservation)
 )
+
+const (
+	sdioCbattrKey  = "sdio"
+	sdmmcCbattrKey = "sdmmc"
+)
+
+var (
+	sdioDmaDevPath              = "/dev/amba_virt_sdio_dma"
+	sdioDmaCarveoutBytes uint64 = 16 << 20
+	sdioHostDevices             = map[string]string{
+		"1": "fff2001000.sdmmc1",
+	}
+)
+
+type sdioAdapterSpec struct {
+	label   string
+	sdioID  string
+	hostDev string
+}
+
+func teardownUartPassthrough(domainName string) {
+	releaseDomainUarts(domainName)
+}
+
+func validateSdioSysfs(adapters []sdioAdapterSpec) error {
+	if allowMockPlatformBind {
+		return nil
+	}
+	for _, a := range adapters {
+		devDir := filepath.Join(sysfsPlatformDevices, a.hostDev)
+		if _, err := os.Stat(devDir); err != nil {
+			return logError("SDIO platform device %s does not exist under %s: %v",
+				a.hostDev, sysfsPlatformDevices, err)
+		}
+	}
+	return nil
+}
+
+func sdioAdapterFromBundle(ib types.IoBundle) (*sdioAdapterSpec, bool, error) {
+	if ib.Type != types.IoOther {
+		return nil, false, nil
+	}
+	label := ib.Logicallabel
+	if label == "" {
+		label = ib.Phylabel
+	}
+	if label == "" {
+		return nil, false, nil
+	}
+
+	sdioAttr := ib.Cbattr[sdioCbattrKey]
+	if sdioAttr == "" {
+		sdioAttr = ib.Cbattr[sdmmcCbattrKey]
+	}
+	if sdioAttr == "" {
+		return nil, false, nil
+	}
+
+	if sdioAttr == "0" {
+		return nil, false, fmt.Errorf("SDIO0 (EMMC0) is reserved for EVE Dom0 management storage and cannot be assigned to a guest")
+	}
+
+	hostDev, ok := sdioHostDevices[sdioAttr]
+	if !ok {
+		return nil, false, logError("sdio adapter %s: unsupported sdio ID %q", label, sdioAttr)
+	}
+
+	return &sdioAdapterSpec{
+		label:   label,
+		sdioID:  sdioAttr,
+		hostDev: hostDev,
+	}, true, nil
+}
+
+func collectSdioAdapters(domainName string, aa *types.AssignableAdapters,
+	domainAdapterList []types.IoAdapter, domainUUID uuid.UUID) ([]sdioAdapterSpec, error) {
+	var adapters []sdioAdapterSpec
+	seen := make(map[string]bool)
+	for _, adapter := range domainAdapterList {
+		aaList := aa.LookupIoBundleAny(adapter.Name)
+		if len(aaList) == 0 {
+			continue
+		}
+		for _, ib := range aaList {
+			if ib == nil {
+				continue
+			}
+			spec, match, err := sdioAdapterFromBundle(*ib)
+			if err != nil {
+				return nil, err
+			}
+			if !match || spec == nil || seen[spec.hostDev] {
+				continue
+			}
+			seen[spec.hostDev] = true
+			adapters = append(adapters, *spec)
+		}
+	}
+	return adapters, nil
+}
+
+func setupSdioPassthrough(domainName string, domainUUID uuid.UUID, aa *types.AssignableAdapters, adapters []sdioAdapterSpec) error {
+	if len(adapters) == 0 {
+		return nil
+	}
+
+	if err := validateSdioSysfs(adapters); err != nil {
+		return err
+	}
+
+	if !allowMockPlatformBind {
+		if _, err := os.Stat(sdioDmaDevPath); err != nil {
+			return logError("SDIO DMA carveout %s is missing: %v", sdioDmaDevPath, err)
+		}
+	}
+
+	domainLeaseLock.Lock()
+	if !allowMockPlatformBind {
+		for _, a := range adapters {
+			if owner, ok := domainSdioOwners[a.hostDev]; ok && owner != domainName {
+				domainLeaseLock.Unlock()
+				return logError("SDIO host device %s is already bound to domain %s", a.hostDev, owner)
+			}
+		}
+	}
+	prevRes := domainSdioState[domainName]
+	domainLeaseLock.Unlock()
+
+	var newlyBound []string
+	for _, a := range adapters {
+		devDir := filepath.Join(sysfsPlatformDevices, a.hostDev)
+		if allowMockPlatformBind {
+			if _, err := os.Stat(devDir); os.IsNotExist(err) {
+				continue
+			}
+		}
+		alreadyOwnedBySelf := false
+		if prevRes != nil {
+			for _, prevDev := range prevRes.hostDevices {
+				if prevDev == a.hostDev {
+					alreadyOwnedBySelf = true
+					break
+				}
+			}
+		}
+		if err := PlatformReserveGeneric(a.hostDev); err != nil {
+			for _, bound := range newlyBound {
+				_ = PlatformReleaseGeneric(bound)
+			}
+			return err
+		}
+		if !alreadyOwnedBySelf {
+			newlyBound = append(newlyBound, a.hostDev)
+		}
+	}
+
+	hostDevs := make([]string, 0, len(adapters))
+	var leaseInfoToSave *domainDmaLeaseInfo
+	domainLeaseLock.Lock()
+	for _, a := range adapters {
+		hostDevs = append(hostDevs, a.hostDev)
+		domainSdioOwners[a.hostDev] = domainName
+	}
+	domainSdioState[domainName] = &domainSdioReservation{
+		domainUUID:  domainUUID,
+		aa:          aa,
+		hostDevices: hostDevs,
+	}
+	if info, ok := domainLeases[domainName]; ok && info != nil {
+		info.SdioDevs = hostDevs
+		leaseInfoToSave = info
+	}
+	domainLeaseLock.Unlock()
+	if leaseInfoToSave != nil {
+		_ = saveDomainLease(domainName, leaseInfoToSave)
+	}
+	return nil
+}
+
+func teardownSdioPassthrough(domainName string) {
+	domainLeaseLock.Lock()
+	res := domainSdioState[domainName]
+	delete(domainSdioState, domainName)
+	var hostDevs []string
+	if res != nil {
+		hostDevs = append(hostDevs, res.hostDevices...)
+	}
+	if info, ok := domainLeases[domainName]; ok && info != nil && len(hostDevs) == 0 {
+		hostDevs = append(hostDevs, info.SdioDevs...)
+	}
+	for _, hostDev := range hostDevs {
+		if owner, ok := domainSdioOwners[hostDev]; ok && owner == domainName {
+			delete(domainSdioOwners, hostDev)
+		}
+	}
+	domainLeaseLock.Unlock()
+
+	for _, hostDev := range hostDevs {
+		devDir := filepath.Join(sysfsPlatformDevices, hostDev)
+		if allowMockPlatformBind {
+			if _, err := os.Stat(devDir); os.IsNotExist(err) {
+				continue
+			}
+		}
+		if err := PlatformReleaseGeneric(hostDev); err != nil {
+			logrus.Warnf("teardownSdioPassthrough: failed to release %s for domain %s: %v",
+				hostDev, domainName, err)
+		}
+	}
+}
+
+func sdioPassthroughVMMOverhead(domainName string, aa *types.AssignableAdapters,
+	domainAdapterList []types.IoAdapter, domainUUID uuid.UUID) (int64, error) {
+	adapters, err := collectSdioAdapters(domainName, aa, domainAdapterList, domainUUID)
+	if err != nil {
+		return 0, err
+	}
+	if len(adapters) > 0 {
+		logrus.Infof("sdioPassthroughVMMOverhead: counting 16 MiB DMA carveout for SDIO (domain %s)",
+			domainName)
+		return int64(sdioDmaCarveoutBytes), nil
+	}
+	return 0, nil
+}
 
 func uartDmaEndpointID(uartID string) (uint32, error) {
 	switch uartID {
@@ -1594,6 +1854,8 @@ func cleanupFailedDomainStart(domainName string) {
 	releaseDmaLease(domainName)
 	releaseDomainUarts(domainName)
 	releaseDomainUsbController(domainName)
+	teardownSdioPassthrough(domainName)
+	teardownSdioPassthrough(domainName)
 	if res != nil {
 		releaseDomainAdapterReservations(res.aa, res.domainUUID)
 	}
@@ -1754,21 +2016,20 @@ func releaseDmaLease(domainName string) {
 	}
 }
 
-// uartPassthroughVMMOverhead charges 16 MiB for each UART adapter
-// because each adapter is backed by a 16 MiB low DMA32 slice.
+// uartPassthroughVMMOverhead charges 16 MiB once when UART passthrough is active,
+// backed by a shared 16 MiB low DMA32 slice.
 func uartPassthroughVMMOverhead(domainName string, aa *types.AssignableAdapters,
 	domainAdapterList []types.IoAdapter, domainUUID uuid.UUID) (int64, error) {
 	uarts, err := collectUartAdapters(domainName, aa, domainAdapterList, domainUUID)
 	if err != nil {
 		return 0, err
 	}
-	var total int64
-	for _, u := range uarts {
-		logrus.Infof("uartPassthroughVMMOverhead: counting 16 MiB DMA32 lease window for UART%s (domain %s)",
-			u.uartID, domainName)
-		total += int64(16 << 20)
+	if len(uarts) > 0 {
+		logrus.Infof("uartPassthroughVMMOverhead: counting 16 MiB DMA32 lease window for UART (domain %s)",
+			domainName)
+		return int64(16 << 20), nil
 	}
-	return total, nil
+	return 0, nil
 }
 
 type shmLeaseInfo struct {
@@ -2344,9 +2605,14 @@ func estimatedVMMOverhead(domainName string, aa *types.AssignableAdapters, domai
 		return 0, logError("uartPassthroughVMMOverhead() failed for domain %s: %v",
 			domainName, err)
 	}
+	sdioOverhead, err := sdioPassthroughVMMOverhead(domainName, aa, domainAdapterList, domainUUID)
+	if err != nil {
+		return 0, logError("sdioPassthroughVMMOverhead() failed for domain %s: %v",
+			domainName, err)
+	}
 	overhead = undefinedVMMOverhead() + ramVMMOverhead(domainRAMSize) +
 		qemuVMMOverhead() + cpuVMMOverhead(domainMaxCpus, domainVcpus) + mmioOverhead +
-		ivshmemOverhead + uartOverhead
+		ivshmemOverhead + uartOverhead + sdioOverhead
 
 	return overhead, nil
 }
@@ -3281,6 +3547,7 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 	var dmaAssigned bool
 	var uartReserved bool
 	var usbReserved bool
+	var sdioReserved bool
 	hadPriorUartReservation := hasDomainUartReservation(domainName)
 	defer func() {
 		if err != nil && shmAssigned {
@@ -3298,6 +3565,9 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 			}
 			if usbReserved {
 				releaseDomainUsbController(domainName)
+			}
+			if sdioReserved {
+				teardownSdioPassthrough(domainName)
 			}
 		}
 	}()
@@ -3768,42 +4038,41 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 				return logError("can't write UART vfio-platform assignment to config file %s (%v)",
 					tmpFile.Name(), err)
 			}
+		}
 
-			leasePath := ambaDmaLeasePathFunc(leaseID)
-			if _, err := os.Stat(ambaDmaCtlDev); err == nil {
-				fi, err := os.Lstat(leasePath)
-				if err != nil {
-					return logError("DMA32 lease device %s is missing: %v", leasePath, err)
-				}
-				if fi.Mode()&os.ModeCharDevice == 0 {
-					fileType := "regular file"
-					if fi.IsDir() {
-						fileType = "directory"
-					} else if fi.Mode()&os.ModeSymlink != 0 {
-						fileType = "symlink"
-					} else if fi.Mode()&os.ModeSocket != 0 {
-						fileType = "socket"
-					} else if fi.Mode()&os.ModeNamedPipe != 0 {
-						fileType = "named pipe"
-					} else if fi.Mode()&os.ModeDevice != 0 {
-						fileType = "block device"
-					}
-					return logError("DMA32 lease path %s is not a character device (type: %s, mode: %s)",
-						leasePath, fileType, fi.Mode().String())
-				}
+		leasePath := ambaDmaLeasePathFunc(leaseID)
+		if _, err := os.Stat(ambaDmaCtlDev); err == nil {
+			fi, err := os.Lstat(leasePath)
+			if err != nil {
+				return logError("DMA32 lease device %s is missing: %v", leasePath, err)
 			}
+			if fi.Mode()&os.ModeCharDevice == 0 {
+				fileType := "regular file"
+				if fi.IsDir() {
+					fileType = "directory"
+				} else if fi.Mode()&os.ModeSymlink != 0 {
+					fileType = "symlink"
+				} else if fi.Mode()&os.ModeSocket != 0 {
+					fileType = "socket"
+				} else if fi.Mode()&os.ModeNamedPipe != 0 {
+					fileType = "named pipe"
+				} else if fi.Mode()&os.ModeDevice != 0 {
+					fileType = "block device"
+				}
+				return logError("DMA32 lease path %s is not a character device (type: %s, mode: %s)",
+					leasePath, fileType, fi.Mode().String())
+			}
+		}
 
-			logrus.Infof("Adding DMA32 lease window <%s> backed by %s (16 MiB)",
-				u.id, leasePath)
-			leaseContext := tQemuIvshmemContext{
-				ID:      fmt.Sprintf("dma32-lease%d", leaseID),
-				MemPath: leasePath,
-				Size:    16 << 20,
-			}
-			if err = tQemuIvshmem.Execute(tmpFile, leaseContext); err != nil {
-				return logError("can't write DMA32 lease assignment to config file %s (%v)",
-					tmpFile.Name(), err)
-			}
+		logrus.Infof("Adding DMA32 lease window backed by %s (16 MiB)", leasePath)
+		leaseContext := tQemuIvshmemContext{
+			ID:      fmt.Sprintf("dma32-lease%d", leaseID),
+			MemPath: leasePath,
+			Size:    16 << 20,
+		}
+		if err = tQemuIvshmem.Execute(tmpFile, leaseContext); err != nil {
+			return logError("can't write DMA32 lease assignment to config file %s (%v)",
+				tmpFile.Name(), err)
 		}
 	} else {
 		savedLease := loadDomainLease(domainName)
@@ -3811,6 +4080,58 @@ func (ctx KvmContext) CreateDomConfig(domainName string,
 			allocatedCID = savedLease.Cid
 		} else {
 			allocatedCID = atomic.AddUint32(&clientCid, 1)
+		}
+	}
+
+	sdioAdapters, err := collectSdioAdapters(domainName, aa,
+		config.IoAdapterList, config.UUIDandVersion.UUID)
+	if err != nil {
+		if uartReserved {
+			teardownUartPassthrough(domainName)
+			releaseDomainAdapterReservations(aa, config.UUIDandVersion.UUID)
+		}
+		return err
+	}
+
+	if len(sdioAdapters) > 0 {
+		if err := validateSdioSysfs(sdioAdapters); err != nil {
+			if uartReserved {
+				teardownUartPassthrough(domainName)
+				releaseDomainAdapterReservations(aa, config.UUIDandVersion.UUID)
+			}
+			return err
+		}
+		if err := setupSdioPassthrough(domainName, config.UUIDandVersion.UUID, aa, sdioAdapters); err != nil {
+			if uartReserved {
+				teardownUartPassthrough(domainName)
+				releaseDomainAdapterReservations(aa, config.UUIDandVersion.UUID)
+			}
+			return logError("failed to bind SDIO vfio-platform for domain %s: %v", domainName, err)
+		}
+		sdioReserved = true
+
+		for _, sa := range sdioAdapters {
+			logrus.Infof("Adding SDIO vfio-platform <%s> host %s", sa.label, sa.hostDev)
+			vfioContext := tQemuVfioPlatformContext{
+				DeviceID: "vfio-sdio",
+				Host:     sa.hostDev,
+			}
+			if err = tQemuVfioPlatform.Execute(tmpFile, vfioContext); err != nil {
+				return logError("can't write SDIO vfio-platform assignment to config file %s (%v)",
+					tmpFile.Name(), err)
+			}
+		}
+
+		logrus.Infof("Adding SDIO DMA carveout backed by %s (%d bytes)", sdioDmaDevPath, sdioDmaCarveoutBytes)
+		sdioDmaContext := tQemuIvshmemContext{
+			ID:       "amba-virt-sdio-dma-shm",
+			MemPath:  sdioDmaDevPath,
+			Size:     sdioDmaCarveoutBytes,
+			ReadOnly: false,
+		}
+		if err = tQemuIvshmem.Execute(tmpFile, sdioDmaContext); err != nil {
+			return logError("can't write SDIO DMA ivshmem assignment to config file %s (%v)",
+				tmpFile.Name(), err)
 		}
 	}
 
@@ -4121,6 +4442,7 @@ func (ctx KvmContext) Stop(domainName string, force bool) error {
 	if !qmpPresent || force {
 		releaseDomainUarts(domainName)
 		releaseDomainUsbController(domainName)
+		teardownSdioPassthrough(domainName)
 	}
 	return nil
 }
@@ -4143,6 +4465,8 @@ func (ctx KvmContext) Delete(domainName string) (result error) {
 	releaseDmaLease(domainName)
 	releaseDomainUarts(domainName)
 	releaseDomainUsbController(domainName)
+	teardownSdioPassthrough(domainName)
+	teardownSdioPassthrough(domainName)
 	// we may want to wait a little bit here and actually kill qemu process if it gets wedged
 	if err := os.RemoveAll(kvmStateDir + domainName); err != nil {
 		return logError("failed to clean up domain state directory %s (%v)", domainName, err)
@@ -4180,6 +4504,7 @@ func (ctx KvmContext) Cleanup(domainName string) error {
 	}
 	releaseDomainUarts(domainName)
 	releaseDomainUsbController(domainName)
+	teardownSdioPassthrough(domainName)
 
 	// Cleanup OVMF settings
 	settingsFile, err := getOVMFSettingsFilename(domainName)
